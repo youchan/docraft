@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: file:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <title>Docraft</title>
+  </head>
+  <body>
+    <header id="titlebar">
+      <span id="doc-name">Untitled</span><span id="dirty-dot" hidden>●</span>
+    </header>
+    <main id="editor"></main>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>
