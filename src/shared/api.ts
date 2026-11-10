@@ -1,9 +1,39 @@
 /** Commands sent from the application menu (main) to the renderer. */
-export type MenuCommand = 'new' | 'open' | 'save' | 'saveAs'
+export type MenuCommand = 'open' | 'save' | 'saveAs'
 
 export interface OpenedFile {
   path: string
   content: string
+}
+
+/**
+ * A node of the folder tree. `id` is the absolute path.
+ * Folders have `children` (possibly empty); files do not.
+ */
+export interface TreeEntry {
+  id: string
+  name: string
+  children?: TreeEntry[]
+}
+
+export interface OpenedFolder {
+  root: string
+  tree: TreeEntry[]
+}
+
+/** What the user picked in the file tree's context menu. */
+export type ContextAction = 'newFile' | 'newFolder' | 'rename' | 'reveal' | 'trash'
+
+/** Result of reading ~/.docraft/config.toml. */
+export interface WorkspaceInfo {
+  /** Absolute path of the config file (shown in the in-app guide). */
+  configPath: string
+  /** The documents folder and its tree; null when it could not be used. */
+  folder: OpenedFolder | null
+  /** Why `folder` is null. */
+  problem: null | 'no-config' | 'not-set' | 'not-found'
+  /** Resolved `documents_folder` value, when one was configured. */
+  configuredPath: string | null
 }
 
 /** API exposed to the renderer as `window.docraft` via contextBridge. */
@@ -11,13 +41,37 @@ export interface DocraftApi {
   platform: string
   /** Show an open dialog. Resolves null when cancelled. */
   openFile(): Promise<OpenedFile | null>
+  /** Read a file inside a granted folder (or one previously granted by a dialog). */
+  readFile(path: string): Promise<string>
   /**
-   * Save content. With path = null (or a path not previously granted by a dialog)
+   * Save content. With path = null (or a path not previously granted)
    * a save dialog is shown. Resolves the saved path, or null when cancelled.
    */
   saveFile(path: string | null, content: string): Promise<string | null>
-  /** Ask the user whether to discard unsaved changes. */
-  confirmDiscard(): Promise<boolean>
+
+  /** Read ~/.docraft/config.toml and scan the configured documents folder. */
+  loadWorkspace(): Promise<WorkspaceInfo>
+  /** Re-scan the granted folder. */
+  readTree(root: string): Promise<TreeEntry[]>
+  /** Create an empty Markdown file or folder in `parent`. Resolves the new path. */
+  createEntry(parent: string, kind: 'file' | 'folder'): Promise<string>
+  /** Rename an entry (a file without extension gets `.md`). Resolves the new path. */
+  renameEntry(path: string, newName: string): Promise<string>
+  /** Move entries into `destDir`. Resolves old path -> new path pairs. */
+  moveEntries(paths: string[], destDir: string): Promise<Record<string, string>>
+  /**
+   * Pop up the native context menu for a tree row (or the empty area = 'root').
+   * `targetFolder` is the name of the folder new items would be created in (shown in the menu).
+   * Resolves the chosen action, or null when dismissed.
+   */
+  showContextMenu(kind: 'root' | 'folder' | 'file', targetFolder: string): Promise<ContextAction | null>
+  /** Show an entry in the system file manager (Finder). */
+  revealEntry(path: string): Promise<void>
+  /** Ask for confirmation, then move entries to the trash. Resolves false when cancelled. */
+  trashEntries(paths: string[]): Promise<boolean>
+
+  /** Called when the window is about to close; the handler should save pending changes. */
+  onBeforeClose(handler: () => Promise<void>): void
   /** Tell main whether the document has unsaved changes (used on window close). */
   setDirty(dirty: boolean): void
   /** Subscribe to menu commands. Returns an unsubscribe function. */

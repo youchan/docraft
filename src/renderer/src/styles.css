@@ -9,6 +9,10 @@
   --quote-bar: #d0d7de;
   --selection: #cfe0ff;
   --titlebar-bg: #fbfbfc;
+  --sidebar-bg: #f6f7f9;
+  --row-hover: #eceef1;
+  --row-selected: #dfe3e9;
+  --row-active: #d6e3ff;
 
   --tok-keyword: #a626a4;
   --tok-string: #50a14f;
@@ -37,6 +41,10 @@
     --quote-bar: #44484d;
     --selection: #2f4a7a;
     --titlebar-bg: #202124;
+    --sidebar-bg: #212326;
+    --row-hover: #2a2c30;
+    --row-selected: #33363b;
+    --row-active: #2b3f66;
 
     --tok-keyword: #c678dd;
     --tok-string: #98c379;
@@ -89,9 +97,153 @@ body:not(.platform-darwin) #titlebar {
   color: var(--accent);
 }
 
+/* ---- Layout -------------------------------------------------------------- */
+#root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+#body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+/* ---- Sidebar (file tree) ------------------------------------------------- */
+#sidebar-wrap {
+  flex: none;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--sidebar-bg);
+}
+#sidebar {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  user-select: none;
+}
+.sidebar-head {
+  flex: none;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 8px 0 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.sidebar-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.icon-btn {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+.icon-btn:hover {
+  background: var(--row-hover);
+  color: var(--fg);
+}
+.icon-btn svg,
+.tree-icon {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+.sidebar-tree {
+  flex: 1;
+  min-height: 0;
+}
+.sidebar-tree [role='tree']:focus {
+  outline: none;
+}
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-right: 8px;
+  border-radius: 5px;
+  font-size: 13px;
+  color: var(--fg);
+  cursor: default;
+}
+.tree-row:hover {
+  background: var(--row-hover);
+}
+.tree-row.selected {
+  background: var(--row-selected);
+}
+.tree-row.active {
+  background: var(--row-active);
+}
+.tree-row.drop-target {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+.tree-row.dragging {
+  opacity: 0.5;
+}
+.chev {
+  flex: none;
+  width: 12px;
+  font-size: 10px;
+  text-align: center;
+  color: var(--muted);
+}
+.tree-icon {
+  flex: none;
+  color: var(--muted);
+}
+.tree-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tree-rename {
+  flex: 1;
+  min-width: 0;
+  padding: 1px 4px;
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  outline: none;
+}
+#sidebar-resizer {
+  flex: none;
+  width: 5px;
+  margin: 0 -2px 0 -3px;
+  z-index: 1;
+  border-left: 1px solid var(--border);
+  cursor: col-resize;
+}
+#sidebar-resizer:hover {
+  border-left-color: var(--accent);
+}
+
 /* ---- Editor -------------------------------------------------------------- */
 #editor {
   flex: 1;
+  min-width: 0;
   min-height: 0;
 }
 
@@ -159,6 +311,23 @@ body:not(.platform-darwin) #titlebar {
   text-decoration: underline;
   text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
   text-underline-offset: 3px;
+}
+
+#editor .cm-md-wikilink {
+  color: var(--accent);
+}
+#editor .cm-md-wikilink-rendered {
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+#editor .cm-md-wikilink-missing {
+  color: var(--muted);
+}
+#editor .cm-md-wikilink-missing.cm-md-wikilink-rendered {
+  text-decoration-style: dashed;
+  text-decoration-color: var(--muted);
 }
 
 #editor .cm-md-inline-code {
@@ -241,4 +410,15 @@ body:not(.platform-darwin) #titlebar {
 #editor .cm-md-image-missing {
   color: var(--muted);
   font-size: 0.9em;
+}
+
+/* ---- Empty state (no document open) ------------------------------------- */
+#empty-state {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted, #888);
+  font-size: 14px;
+  user-select: none;
 }

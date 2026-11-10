@@ -1,5 +1,5 @@
 import { syntaxTree } from '@codemirror/language'
-import type { EditorState, Extension, Range } from '@codemirror/state'
+import { StateEffect, type EditorState, type Extension, type Range } from '@codemirror/state'
 import {
   Decoration,
   EditorView,
@@ -21,7 +21,14 @@ import type { SyntaxNode } from '@lezer/common'
 export interface LivePreviewOptions {
   /** Directory of the current file, used to resolve relative image paths. */
   baseDir: () => string | null
+  /** Whether `[[name]]` points to an existing file. */
+  isLinkResolved: (name: string) => boolean
+  /** Open the file `[[name]]` points to. */
+  openLink: (name: string) => void
 }
+
+/** Dispatch to force the decorations (e.g. wiki-link states) to be rebuilt. */
+export const refreshLinks = StateEffect.define<null>()
 
 // ---------------------------------------------------------------------------
 // Widgets
@@ -107,6 +114,12 @@ function activeLines(state: EditorState): Set<number> {
   return lines
 }
 
+/** Split `[[name|label]]` contents. */
+function splitWiki(inner: string): { name: string; labelFrom: number } {
+  const bar = inner.indexOf('|')
+  return bar < 0 ? { name: inner.trim(), labelFrom: 0 } : { name: inner.slice(0, bar).trim(), labelFrom: bar + 1 }
+}
+
 function resolveImageSrc(url: string, baseDir: string | null): string {
   if (/^(data:|blob:|file:|https?:)/i.test(url)) return url
   const toFileUrl = (p: string): string => 'file://' + encodeURI(p.replace(/\\/g, '/'))
@@ -177,6 +190,36 @@ function buildDecorations(view: EditorView, opts: LivePreviewOptions): Decoratio
 
         case 'Link': {
           const marks = node.getChildren('LinkMark')
+
+          // Wiki link: the parser sees `[[x]]` as a Link `[x]` wrapped in one more `[` and `]`.
+          if (
+            marks.length === 2 &&
+            node.from > 0 &&
+            doc.sliceString(node.from - 1, node.from) === '[' &&
+            doc.sliceString(node.to, node.to + 1) === ']' &&
+            doc.sliceString(node.to + 1, node.to + 2) !== '('
+          ) {
+            const inner = doc.sliceString(marks[0].to, marks[1].from)
+            const { name, labelFrom } = splitWiki(inner)
+            if (name) {
+              const outerFrom = node.from - 1
+              const outerTo = node.to + 1
+              const active = isActive(outerFrom, outerTo)
+              const resolved = opts.isLinkResolved(name)
+              const cls = `cm-md-wikilink${resolved ? '' : ' cm-md-wikilink-missing'}${active ? '' : ' cm-md-wikilink-rendered'}`
+              const textFrom = active ? outerFrom : marks[0].to + labelFrom
+              const textTo = active ? outerTo : marks[1].from
+              if (textFrom < textTo) {
+                decos.push(Decoration.mark({ class: cls, attributes: { 'data-wikilink': name } }).range(textFrom, textTo))
+              }
+              if (!active) {
+                hide(outerFrom, marks[0].to + labelFrom) // "[[" and "name|"
+                hide(marks[1].from, outerTo) // "]]"
+              }
+              return false
+            }
+          }
+
           if (marks.length >= 2) {
             decos.push(markDeco('cm-md-link').range(marks[0].to, marks[1].from))
             if (!isActive(node.from, node.to)) {
@@ -310,12 +353,26 @@ export function livePreview(opts: LivePreviewOptions): Extension {
           u.viewportChanged ||
           u.selectionSet ||
           u.focusChanged ||
-          syntaxTree(u.startState) !== syntaxTree(u.state)
+          syntaxTree(u.startState) !== syntaxTree(u.state) ||
+          u.transactions.some((tr) => tr.effects.some((e) => e.is(refreshLinks)))
         ) {
           this.decorations = buildDecorations(u.view, opts)
         }
       }
     },
-    { decorations: (v) => v.decorations }
+    {
+      decorations: (v) => v.decorations,
+      eventHandlers: {
+        // A rendered wiki link opens on click; a raw one (cursor on its line) needs Cmd/Ctrl+click.
+        mousedown(e) {
+          const el = (e.target as HTMLElement | null)?.closest<HTMLElement>('[data-wikilink]')
+          const name = el?.dataset['wikilink']
+          if (!el || !name || e.button !== 0) return
+          if (!el.classList.contains('cm-md-wikilink-rendered') && !(e.metaKey || e.ctrlKey)) return
+          e.preventDefault()
+          opts.openLink(name)
+        }
+      }
+    }
   )
 }
