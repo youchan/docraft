@@ -8,10 +8,11 @@ import {
   shell,
   type MenuItemConstructorOptions
 } from 'electron'
-import { access, mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { access, mkdir, readdir, readFile, rename, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
-import { basename, dirname, extname, isAbsolute, join, resolve, sep } from 'node:path'
-import type { ContextAction, MenuCommand, OpenedFile, TreeEntry, WorkspaceInfo } from '../shared/api'
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import type { ContextAction, MenuCommand, OpenedFile, TodoItem, TreeEntry, WorkspaceInfo } from '../shared/api'
 
 const isMac = process.platform === 'darwin'
 const devServerUrl = process.env['ELECTRON_RENDERER_URL']
@@ -109,6 +110,91 @@ async function scanTree(dir: string): Promise<TreeEntry[]> {
 }
 
 // ---------------------------------------------------------------------------
+// TODOs: <root>/.todo/<title>.md, subtasks in <root>/.todo/<title>/<subtask>.md
+// ---------------------------------------------------------------------------
+const TODO_DIR = '.todo'
+const COMPLETED_DIR = '.completed'
+const COMPLETED_TTL_MS = 30 * 24 * 60 * 60 * 1000
+
+function todoRoot(st: WindowState): string {
+  if (!st.root) throw new Error('documents folder is not set')
+  return join(st.root, TODO_DIR)
+}
+
+/** A path of a TODO file: inside `.todo` and a Markdown file. */
+function assertTodoPath(st: WindowState, p: unknown): string {
+  const abs = assertInsideRoot(st, p)
+  if (!abs.startsWith(todoRoot(st) + sep) || extname(abs).toLowerCase() !== '.md') throw new Error('not a TODO')
+  if (abs.startsWith(join(todoRoot(st), COMPLETED_DIR) + sep)) throw new Error('not a TODO')
+  return abs
+}
+
+/** A TODO title: a valid file name without `.md`, and not hidden (so it cannot clash with `.completed`). */
+function assertTodoName(title: unknown): string {
+  const name = assertValidName(title).replace(/\.md$/i, '').trim()
+  if (!name || name.startsWith('.')) throw new Error('invalid name')
+  return name
+}
+
+/** Number of subtasks below a TODO, at any depth. */
+async function countSubtasks(todoPath: string): Promise<number> {
+  let n = 0
+  for (const c of await listMarkdown(subtaskDir(todoPath))) n += 1 + (await countSubtasks(c.id))
+  return n
+}
+
+/**
+ * Move a TODO and all of its subtasks to `.completed/<uuid>.md`, each with `# <path below .todo>`
+ * on top. The file is rewritten, so its mtime is the completion time (used for the 30-day purge).
+ */
+async function completeTodoTree(st: WindowState, file: string): Promise<void> {
+  const base = todoRoot(st)
+  const completedDir = join(base, COMPLETED_DIR)
+  await mkdir(completedDir, { recursive: true })
+  const walk = async (f: string): Promise<void> => {
+    for (const c of await listMarkdown(subtaskDir(f))) await walk(c.id)
+    const title = relative(base, f).slice(0, -extname(f).length).split(sep).join('/')
+    const body = await readFile(f, 'utf8')
+    await writeFile(join(completedDir, `${randomUUID()}.md`), `# ${title}\n\n${body}`, { encoding: 'utf8', flag: 'wx' })
+    await unlink(f)
+    await rmdir(subtaskDir(f)).catch(() => undefined) // only succeeds when empty
+  }
+  await walk(file)
+}
+
+/** Delete completed TODOs that were completed more than 30 days ago. Runs once at startup. */
+let completedPurged = false
+async function purgeCompleted(root: string): Promise<void> {
+  const dir = join(root, TODO_DIR, COMPLETED_DIR)
+  const now = Date.now()
+  for (const item of await listMarkdown(dir)) {
+    try {
+      if (now - (await stat(item.id)).mtimeMs > COMPLETED_TTL_MS) await unlink(item.id)
+    } catch {
+      // ignore files that vanish or cannot be removed
+    }
+  }
+}
+
+/** The folder that holds a TODO's subtasks: same path without `.md`. */
+function subtaskDir(todoPath: string): string {
+  return join(dirname(todoPath), basename(todoPath, extname(todoPath)))
+}
+
+async function listMarkdown(dir: string): Promise<TodoItem[]> {
+  let entries
+  try {
+    entries = await readdir(dir, { withFileTypes: true })
+  } catch {
+    return []
+  }
+  return entries
+    .filter((e) => e.isFile() && !e.name.startsWith('.') && MD_EXTS.has(extname(e.name).toLowerCase()))
+    .map((e) => ({ id: join(dir, e.name), name: basename(e.name, extname(e.name)) }))
+    .sort((a, b) => a.name.localeCompare(b.name, 'ja', { numeric: true }))
+}
+
+// ---------------------------------------------------------------------------
 // Config: ~/.docraft/config.toml  ->  documents_folder = ~/docs/docraft
 // ---------------------------------------------------------------------------
 const configDir = join(homedir(), '.docraft')
@@ -162,6 +248,10 @@ async function loadWorkspace(st: WindowState): Promise<WorkspaceInfo> {
   try {
     if (!(await stat(root)).isDirectory()) return { ...info, folder: null, problem: 'not-found' }
     st.root = root
+    if (!completedPurged) {
+      completedPurged = true
+      void purgeCompleted(root).catch(() => undefined)
+    }
     return { ...info, folder: { root, tree: await scanTree(root) }, problem: null }
   } catch {
     return { ...info, folder: null, problem: 'not-found' }
@@ -385,6 +475,89 @@ function registerIpc(): void {
     if (res.response !== 0) return false
     for (const t of targets) await shell.trashItem(t)
     return true
+  })
+
+  // ---- TODOs -----------------------------------------------------------------
+  ipcMain.handle('todo:list', (e): Promise<TodoItem[]> => {
+    const st = stateOf(e.sender)
+    return st.root ? listMarkdown(todoRoot(st)) : Promise.resolve([])
+  })
+
+  ipcMain.handle('todo:subtasks', (e, todoPath: unknown): Promise<TodoItem[]> => {
+    return listMarkdown(subtaskDir(assertTodoPath(stateOf(e.sender), todoPath)))
+  })
+
+  ipcMain.handle('todo:create', async (e, parent: unknown, title: unknown): Promise<string> => {
+    const st = stateOf(e.sender)
+    const dir = parent === null ? todoRoot(st) : subtaskDir(assertTodoPath(st, parent))
+    const name = assertTodoName(title)
+    const target = join(dir, `${name}.md`)
+    if (await exists(target)) throw new Error(`「${name}」はすでに存在します。`)
+    await mkdir(dir, { recursive: true })
+    await writeFile(target, '', { encoding: 'utf8', flag: 'wx' })
+    return target
+  })
+
+  ipcMain.handle('todo:complete', async (e, todoPath: unknown): Promise<boolean> => {
+    const st = stateOf(e.sender)
+    const file = assertTodoPath(st, todoPath)
+    const n = await countSubtasks(file)
+    if (n > 0) {
+      const win = BrowserWindow.fromWebContents(e.sender)
+      const opts: Electron.MessageBoxOptions = {
+        type: 'question',
+        buttons: ['サブタスクも完了する', 'キャンセル'],
+        defaultId: 1,
+        cancelId: 1,
+        message: `「${basename(file, extname(file))}」には未完了のサブタスクが ${n} 件あります。`,
+        detail: 'サブタスクも完了してよいですか?'
+      }
+      const res = win ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts)
+      if (res.response !== 0) return false
+    }
+    await completeTodoTree(st, file)
+    return true
+  })
+
+  ipcMain.handle('todo:rename', async (e, todoPath: unknown, newName: unknown): Promise<string> => {
+    const file = assertTodoPath(stateOf(e.sender), todoPath)
+    const name = assertTodoName(newName)
+    const dest = join(dirname(file), `${name}.md`)
+    if (dest === file) return file
+    const dir = subtaskDir(file)
+    const destDir = join(dirname(file), name)
+    const caseOnly = dest.toLowerCase() === file.toLowerCase()
+    if (!caseOnly && ((await exists(dest)) || (await exists(destDir)))) throw new Error(`「${name}」はすでに存在します。`)
+    await rename(file, dest)
+    if (await exists(dir)) await rename(dir, destDir)
+    return dest
+  })
+
+  ipcMain.handle('todo:trash', async (e, todoPath: unknown): Promise<boolean> => {
+    const st = stateOf(e.sender)
+    const file = assertTodoPath(st, todoPath)
+    const win = BrowserWindow.fromWebContents(e.sender)
+    const opts: Electron.MessageBoxOptions = {
+      type: 'warning',
+      buttons: ['ゴミ箱に移動', 'キャンセル'],
+      defaultId: 1,
+      cancelId: 1,
+      message: `TODO「${basename(file, extname(file))}」をゴミ箱に移動しますか?`,
+      detail: 'サブタスクもまとめて移動されます。'
+    }
+    const res = win ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts)
+    if (res.response !== 0) return false
+    const dir = subtaskDir(file)
+    if (await exists(file)) await shell.trashItem(file)
+    if (await exists(dir)) await shell.trashItem(dir)
+    return true
+  })
+
+  ipcMain.handle('link:external', async (_e, url: unknown): Promise<void> => {
+    if (typeof url !== 'string') throw new Error('invalid url')
+    const u = new URL(url.trim())
+    if (!['http:', 'https:', 'mailto:'].includes(u.protocol)) throw new Error('unsupported protocol')
+    await shell.openExternal(u.toString())
   })
 
   ipcMain.on('app:close-ready', (e) => {

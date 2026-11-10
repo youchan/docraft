@@ -21,6 +21,13 @@ export interface OpenedFolder {
   tree: TreeEntry[]
 }
 
+/** A TODO (a Markdown file under `<documents_folder>/.todo`). `id` is the absolute path. */
+export interface TodoItem {
+  id: string
+  /** Title = file name without `.md`. */
+  name: string
+}
+
 /** What the user picked in the file tree's context menu. */
 export type ContextAction = 'newFile' | 'newFolder' | 'rename' | 'reveal' | 'trash'
 
@@ -69,6 +76,26 @@ export interface DocraftApi {
   revealEntry(path: string): Promise<void>
   /** Ask for confirmation, then move entries to the trash. Resolves false when cancelled. */
   trashEntries(paths: string[]): Promise<boolean>
+
+  /** Top-level TODOs: `.todo/<title>.md`. */
+  listTodos(): Promise<TodoItem[]>
+  /** Subtasks of a TODO: the `.md` files in the folder next to it with the same name. */
+  listSubtasks(todoPath: string): Promise<TodoItem[]>
+  /** Create a TODO (parent = null) or a subtask of `parent`. Resolves the new file's path. */
+  createTodo(parent: string | null, title: string): Promise<string>
+  /**
+   * Complete a TODO or subtask: move it to `.todo/.completed/<uuid>.md` with `# <title>` on top
+   * (title = its path below `.todo`). When it has subtasks the user is asked first, and they are
+   * completed as well. Resolves false when cancelled.
+   */
+  completeTodo(todoPath: string): Promise<boolean>
+  /** Rename a TODO or subtask (and its subtask folder). Resolves the new path. */
+  renameTodo(todoPath: string, newName: string): Promise<string>
+  /** Ask for confirmation, then move a TODO (and its subtask folder) to the trash. Resolves false when cancelled. */
+  trashTodo(todoPath: string): Promise<boolean>
+
+  /** Open an http(s) or mailto link in the system browser. */
+  openExternal(url: string): Promise<void>
 
   /** Called when the window is about to close; the handler should save pending changes. */
   onBeforeClose(handler: () => Promise<void>): void

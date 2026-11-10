@@ -8,6 +8,7 @@ import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { languages } from '@codemirror/language-data'
 import { highlightSelectionMatches, search, searchKeymap } from '@codemirror/search'
 import { livePreview, refreshLinks } from './editor/livePreview'
+import { tables } from './editor/tables'
 import { docraftHighlight } from './editor/highlight'
 
 export interface EditorHandle {
@@ -34,6 +35,7 @@ interface Hooks {
   onChange: () => void
   isLinkResolved: (name: string) => boolean
   openLink: (name: string) => void
+  openUrl: (url: string) => void
 }
 
 function createState(doc: string, hooks: Hooks, readOnly: boolean): EditorState {
@@ -56,7 +58,8 @@ function createState(doc: string, hooks: Hooks, readOnly: boolean): EditorState 
       markdown({ base: markdownLanguage, codeLanguages: languages }),
       syntaxHighlighting(docraftHighlight),
       EditorView.lineWrapping,
-      livePreview({ baseDir: hooks.getBaseDir, isLinkResolved: hooks.isLinkResolved, openLink: hooks.openLink }),
+      livePreview({ baseDir: hooks.getBaseDir, isLinkResolved: hooks.isLinkResolved, openLink: hooks.openLink, openUrl: hooks.openUrl }),
+      tables(),
       EditorView.updateListener.of((u) => {
         if (u.docChanged) hooks.onChange()
       })
@@ -84,7 +87,8 @@ export const Editor = forwardRef<EditorHandle, Props>(function Editor({ initialD
       getBaseDir: () => baseDirRef.current,
       onChange: () => onChangeRef.current(),
       isLinkResolved: (name) => resolveLinkRef.current(name) !== null,
-      openLink: (name) => onOpenLinkRef.current(name)
+      openLink: (name) => onOpenLinkRef.current(name),
+      openUrl: (url) => void window.docraft.openExternal(url).catch(() => undefined)
       },
       readOnly
     )

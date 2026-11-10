@@ -25,6 +25,8 @@ export interface LivePreviewOptions {
   isLinkResolved: (name: string) => boolean
   /** Open the file `[[name]]` points to. */
   openLink: (name: string) => void
+  /** Open an external URL (http, https, mailto) in the system browser. */
+  openUrl: (url: string) => void
 }
 
 /** Dispatch to force the decorations (e.g. wiki-link states) to be rebuilt. */
@@ -221,13 +223,35 @@ function buildDecorations(view: EditorView, opts: LivePreviewOptions): Decoratio
           }
 
           if (marks.length >= 2) {
-            decos.push(markDeco('cm-md-link').range(marks[0].to, marks[1].from))
-            if (!isActive(node.from, node.to)) {
+            const rendered = !isActive(node.from, node.to)
+            const urlNode = node.getChild('URL')
+            decos.push(
+              Decoration.mark({
+                class: `cm-md-link${rendered ? ' cm-md-link-rendered' : ''}`,
+                attributes: urlNode ? { 'data-url': doc.sliceString(urlNode.from, urlNode.to) } : {}
+              }).range(marks[0].to, marks[1].from)
+            )
+            if (rendered) {
               hide(marks[0].from, marks[0].to) // "["
               hide(marks[1].from, node.to) // "](url)"
             }
           }
           return
+        }
+
+        // Bare URLs (https://example.com) and <https://example.com>. `[text](url)` is handled in 'Link'.
+        case 'URL': {
+          const parent = node.parent?.name
+          if (parent && parent !== 'Link' && parent !== 'Image' && parent !== 'LinkReference') {
+            const rendered = !isActive(node.from, node.to)
+            decos.push(
+              Decoration.mark({
+                class: `cm-md-link${rendered ? ' cm-md-link-rendered' : ''}`,
+                attributes: { 'data-url': doc.sliceString(node.from, node.to) }
+              }).range(node.from, node.to)
+            )
+          }
+          return false
         }
 
         case 'Image': {
@@ -363,14 +387,25 @@ export function livePreview(opts: LivePreviewOptions): Extension {
     {
       decorations: (v) => v.decorations,
       eventHandlers: {
-        // A rendered wiki link opens on click; a raw one (cursor on its line) needs Cmd/Ctrl+click.
+        // Links open on mousedown (a click would already have moved the cursor and re-rendered the line).
+        // A rendered link opens on click; a raw one (cursor on its line) needs Cmd/Ctrl+click.
         mousedown(e) {
-          const el = (e.target as HTMLElement | null)?.closest<HTMLElement>('[data-wikilink]')
-          const name = el?.dataset['wikilink']
-          if (!el || !name || e.button !== 0) return
-          if (!el.classList.contains('cm-md-wikilink-rendered') && !(e.metaKey || e.ctrlKey)) return
+          if (e.button !== 0) return
+          const target = e.target as HTMLElement | null
+          const wiki = target?.closest<HTMLElement>('[data-wikilink]')
+          const external = wiki ? null : target?.closest<HTMLElement>('[data-url]')
+          const el = wiki ?? external
+          if (!el) return
+          const rendered = el.classList.contains(wiki ? 'cm-md-wikilink-rendered' : 'cm-md-link-rendered')
+          if (!rendered && !(e.metaKey || e.ctrlKey)) return
           e.preventDefault()
-          opts.openLink(name)
+          if (wiki) {
+            const name = wiki.dataset['wikilink']
+            if (name) opts.openLink(name)
+          } else {
+            const url = external?.dataset['url']
+            if (url) opts.openUrl(url)
+          }
         }
       }
     }
