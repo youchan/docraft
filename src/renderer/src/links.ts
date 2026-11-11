@@ -7,7 +7,18 @@ import type { TreeEntry } from '../../shared/api'
  * documents folder. A path (`[[sub/設計]]`) matches the end of a file's path relative to the folder.
  * When several files match, the one closest to the current file wins.
  */
+export interface LinkSuggestion {
+  /** Text to put inside `[[…]]`: the file name, or its path when the name is not unique. */
+  name: string
+  /** Folder of the file below the documents folder ('' at the top); for a TODO, its kind. */
+  folder: string
+  /** Text to insert instead of `name` (e.g. `todo:UUID`). */
+  insert?: string
+}
+
 export interface LinkIndex {
+  /** Files whose name (or path) starts with `query`, for `[[` completion. */
+  search(query: string, limit?: number): LinkSuggestion[]
   /** Absolute path of the file `name` points to, or null when there is none. */
   resolve(name: string, fromPath: string | null): string | null
 }
@@ -19,6 +30,9 @@ interface Candidate {
   /** Directory part of `rel`. */
   dir: string
   base: string
+  /** Same as `rel` / `base` with the original letter case. */
+  relShown: string
+  baseShown: string
 }
 
 const EXT = /\.(md|markdown)$/i
@@ -52,13 +66,16 @@ export function buildLinkIndex(root: string, tree: TreeEntry[]): LinkIndex {
         continue
       }
       const full = slashed(e.id)
-      const rel = norm((full.startsWith(rootPrefix) ? full.slice(rootPrefix.length) : full).replace(EXT, ''))
+      const relShown = (full.startsWith(rootPrefix) ? full.slice(rootPrefix.length) : full).replace(EXT, '')
+      const rel = norm(relShown)
       const slash = rel.lastIndexOf('/')
       const cand: Candidate = {
         path: e.id,
         rel,
         dir: slash >= 0 ? rel.slice(0, slash) : '',
-        base: slash >= 0 ? rel.slice(slash + 1) : rel
+        base: slash >= 0 ? rel.slice(slash + 1) : rel,
+        relShown,
+        baseShown: relShown.slice(relShown.lastIndexOf('/') + 1)
       }
       all.push(cand)
       const list = byBase.get(cand.base)
@@ -69,6 +86,18 @@ export function buildLinkIndex(root: string, tree: TreeEntry[]): LinkIndex {
   walk(tree)
 
   return {
+    search(query, limit = 50) {
+      const q = norm(slashed(query.trim()).replace(/^\/+/, ''))
+      return all
+        .filter((c) => c.base.startsWith(q) || c.rel.startsWith(q))
+        .sort((a, b) => a.base.localeCompare(b.base, 'ja', { numeric: true }) || a.rel.localeCompare(b.rel))
+        .slice(0, limit)
+        .map((c) => ({
+          // A bare name is enough when it resolves to this very file; otherwise use the path.
+          name: byBase.get(c.base)?.length === 1 ? c.baseShown : c.relShown,
+          folder: c.relShown.includes('/') ? c.relShown.slice(0, c.relShown.lastIndexOf('/')) : ''
+        }))
+    },
     resolve(name, fromPath) {
       const target = norm(slashed(name.trim()).replace(/^\/+/, '').replace(EXT, ''))
       if (!target) return null

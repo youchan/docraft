@@ -1,3 +1,4 @@
+import { frontmatterEnd } from '../../../shared/frontmatter'
 import { syntaxTree } from '@codemirror/language'
 import { StateEffect, type EditorState, type Extension, type Range } from '@codemirror/state'
 import {
@@ -26,6 +27,8 @@ export interface LivePreviewOptions {
   /** Open the file `[[name]]` points to. */
   openLink: (name: string) => void
   /** Open an external URL (http, https, mailto) in the system browser. */
+  /** Title and state of the TODO with this UUID, or null (for `[[todo:UUID]]`). */
+  todoInfo: (uuid: string) => { title: string; completed: boolean } | null
   openUrl: (url: string) => void
 }
 
@@ -35,6 +38,37 @@ export const refreshLinks = StateEffect.define<null>()
 // ---------------------------------------------------------------------------
 // Widgets
 // ---------------------------------------------------------------------------
+/** `[[todo:UUID]]` shown as the TODO's current title (the UUID is hidden). */
+class TodoLinkWidget extends WidgetType {
+  constructor(
+    readonly name: string,
+    readonly title: string | null,
+    readonly completed: boolean,
+    readonly open: (name: string) => void
+  ) {
+    super()
+  }
+  eq(other: TodoLinkWidget): boolean {
+    return other.name === this.name && other.title === this.title && other.completed === this.completed
+  }
+  toDOM(): HTMLElement {
+    const el = document.createElement('span')
+    el.className = `cm-md-wikilink cm-md-wikilink-rendered cm-md-todolink${this.title === null ? ' cm-md-wikilink-missing' : ''}${
+      this.completed ? ' cm-md-todolink-done' : ''
+    }`
+    el.textContent = this.title ?? '(見つからないTODO)'
+    el.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return
+      e.preventDefault()
+      this.open(this.name)
+    })
+    return el
+  }
+  ignoreEvent(): boolean {
+    return true
+  }
+}
+
 class BulletWidget extends WidgetType {
   eq(): boolean {
     return true
@@ -158,10 +192,14 @@ function buildDecorations(view: EditorView, opts: LivePreviewOptions): Decoratio
   const from = ranges[0].from
   const to = ranges[ranges.length - 1].to
 
+  // The frontmatter block is not Markdown content: leave it alone (it is styled by `frontmatterStyle`).
+  const fmEnd = frontmatterEnd(doc.sliceString(0, Math.min(doc.length, 2000)))
+
   syntaxTree(state).iterate({
     from,
     to,
     enter: (ref) => {
+      if (fmEnd > 0 && ref.name !== 'Document' && ref.to <= fmEnd) return false
       const node = ref.node
       const name = node.name
 
@@ -207,6 +245,17 @@ function buildDecorations(view: EditorView, opts: LivePreviewOptions): Decoratio
               const outerFrom = node.from - 1
               const outerTo = node.to + 1
               const active = isActive(outerFrom, outerTo)
+              const todo = /^todo:\s*([0-9a-f-]{36})$/i.exec(name)
+              if (todo && !active) {
+                const info = opts.todoInfo(todo[1].toLowerCase())
+                decos.push(
+                  Decoration.replace({ widget: new TodoLinkWidget(name, info?.title ?? null, info?.completed ?? false, opts.openLink) }).range(
+                    outerFrom,
+                    outerTo
+                  )
+                )
+                return false
+              }
               const resolved = opts.isLinkResolved(name)
               const cls = `cm-md-wikilink${resolved ? '' : ' cm-md-wikilink-missing'}${active ? '' : ' cm-md-wikilink-rendered'}`
               const textFrom = active ? outerFrom : marks[0].to + labelFrom

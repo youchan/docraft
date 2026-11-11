@@ -8,11 +8,12 @@ import {
   shell,
   type MenuItemConstructorOptions
 } from 'electron'
-import { access, mkdir, readdir, readFile, rename, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { access, cp, mkdir, readdir, readFile, rename, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
-import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import type { ContextAction, MenuCommand, OpenedFile, TodoItem, TreeEntry, WorkspaceInfo } from '../shared/api'
+import { basename, dirname, extname, isAbsolute, join, resolve, sep } from 'node:path'
+import { applyKey, applyTitle, applyDue, isDueString, isUuid, parseDue, parseKey, parseTitle, splitFrontmatter } from '../shared/frontmatter'
+import type { ContextAction, MenuCommand, OpenedFile, TodoItem, TodoRef, TreeEntry, WorkspaceInfo } from '../shared/api'
 
 const isMac = process.platform === 'darwin'
 const devServerUrl = process.env['ELECTRON_RENDERER_URL']
@@ -110,11 +111,15 @@ async function scanTree(dir: string): Promise<TreeEntry[]> {
 }
 
 // ---------------------------------------------------------------------------
-// TODOs: <root>/.todo/<title>.md, subtasks in <root>/.todo/<title>/<subtask>.md
+// TODOs: <root>/.todo/<uuid>.md, subtasks in <root>/.todo/<parent uuid>/<uuid>.md
+//
+// The key of a TODO is the UUID in its file name; its title is the first `# heading` of the file.
+// Completed TODOs keep their UUID: <root>/.todo/.completed/<uuid>.md (`completed:` date, `parent:` uuid).
 // ---------------------------------------------------------------------------
 const TODO_DIR = '.todo'
 const COMPLETED_DIR = '.completed'
 const COMPLETED_TTL_MS = 30 * 24 * 60 * 60 * 1000
+const UNTITLED = '無題'
 
 function todoRoot(st: WindowState): string {
   if (!st.root) throw new Error('documents folder is not set')
@@ -129,11 +134,90 @@ function assertTodoPath(st: WindowState, p: unknown): string {
   return abs
 }
 
-/** A TODO title: a valid file name without `.md`, and not hidden (so it cannot clash with `.completed`). */
-function assertTodoName(title: unknown): string {
-  const name = assertValidName(title).replace(/\.md$/i, '').trim()
-  if (!name || name.startsWith('.')) throw new Error('invalid name')
-  return name
+/** A TODO title: one non-empty line of text. */
+function assertTitle(title: unknown): string {
+  if (typeof title !== 'string') throw new Error('invalid title')
+  const t = title.replace(/\s+/g, ' ').trim()
+  if (!t) throw new Error('invalid title')
+  return t
+}
+
+/** The folder that holds a TODO's subtasks: same path without `.md`. */
+function subtaskDir(todoPath: string): string {
+  return join(dirname(todoPath), basename(todoPath, extname(todoPath)))
+}
+
+const localYmd = (d = new Date()): string =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+
+/** Title (first heading) of a TODO file. */
+async function titleOf(file: string): Promise<string> {
+  return parseTitle(await readFile(file, 'utf8').catch(() => '')) ?? UNTITLED
+}
+
+/** Markdown files directly in `dir`. With `withMeta`, `name` is the title and `due` is read from the file. */
+async function listMarkdown(dir: string, withMeta = false): Promise<TodoItem[]> {
+  let entries
+  try {
+    entries = await readdir(dir, { withFileTypes: true })
+  } catch {
+    return []
+  }
+  const items = await Promise.all(
+    entries
+      .filter((e) => e.isFile() && !e.name.startsWith('.') && MD_EXTS.has(extname(e.name).toLowerCase()))
+      .map(async (e): Promise<TodoItem> => {
+        const id = join(dir, e.name)
+        if (!withMeta) {
+          const base = basename(e.name, extname(e.name))
+          return { id, name: base, title: base, due: null }
+        }
+        const text = await readFile(id, 'utf8').catch(() => '')
+        const title = parseTitle(text) ?? UNTITLED
+        return { id, name: title, title, due: parseDue(text) }
+      })
+  )
+  return items.sort(byDue)
+}
+
+/** Earliest due date first; TODOs without one follow, by title. */
+function byDue(a: TodoItem, b: TodoItem): number {
+  if (a.due !== b.due) return a.due === null ? 1 : b.due === null ? -1 : a.due < b.due ? -1 : 1
+  return a.name.localeCompare(b.name, 'ja', { numeric: true })
+}
+
+/**
+ * Entries of the TODO list: every top-level TODO, plus subtasks (at any depth) that have a due date.
+ * A subtask is named by the titles on its way down, e.g. `買い物/牛乳`.
+ */
+async function listTodoEntries(root: string): Promise<TodoItem[]> {
+  const out: TodoItem[] = []
+  const walk = async (items: TodoItem[], prefix: string): Promise<void> => {
+    for (const t of items) {
+      const name = prefix + t.name
+      if (prefix === '' || t.due) out.push({ ...t, name })
+      await walk(await listMarkdown(subtaskDir(t.id), true), name + '/')
+    }
+  }
+  await walk(await listMarkdown(root, true), '')
+  return out.sort(byDue)
+}
+
+/** Every TODO, open and completed, for resolving and completing `[[todo:UUID]]` references. */
+async function listAllTodos(root: string): Promise<TodoRef[]> {
+  const out: TodoRef[] = []
+  const walk = async (dir: string): Promise<void> => {
+    for (const t of await listMarkdown(dir, true)) {
+      out.push({ uuid: basename(t.id, extname(t.id)), id: t.id, title: t.name, completed: false, due: t.due })
+      await walk(subtaskDir(t.id))
+    }
+  }
+  const base = join(root, TODO_DIR)
+  await walk(base)
+  for (const t of await listMarkdown(join(base, COMPLETED_DIR), true)) {
+    out.push({ uuid: basename(t.id, extname(t.id)), id: t.id, title: t.name, completed: true, due: t.due })
+  }
+  return out
 }
 
 /** Number of subtasks below a TODO, at any depth. */
@@ -144,8 +228,8 @@ async function countSubtasks(todoPath: string): Promise<number> {
 }
 
 /**
- * Move a TODO and all of its subtasks to `.completed/<uuid>.md`, each with `# <path below .todo>`
- * on top. The file is rewritten, so its mtime is the completion time (used for the 30-day purge).
+ * Move a TODO and all of its subtasks to `.completed/<same uuid>.md`. Each file gets
+ * `completed: <today>` (used for the 30-day purge) and, for a subtask, `parent: <parent uuid>`.
  */
 async function completeTodoTree(st: WindowState, file: string): Promise<void> {
   const base = todoRoot(st)
@@ -153,45 +237,138 @@ async function completeTodoTree(st: WindowState, file: string): Promise<void> {
   await mkdir(completedDir, { recursive: true })
   const walk = async (f: string): Promise<void> => {
     for (const c of await listMarkdown(subtaskDir(f))) await walk(c.id)
-    const title = relative(base, f).slice(0, -extname(f).length).split(sep).join('/')
-    const body = await readFile(f, 'utf8')
-    await writeFile(join(completedDir, `${randomUUID()}.md`), `# ${title}\n\n${body}`, { encoding: 'utf8', flag: 'wx' })
+    let text = await readFile(f, 'utf8')
+    if (parseTitle(text) === null) text = applyTitle(text, UNTITLED)
+    text = applyKey(text, 'completed', localYmd())
+    if (dirname(f) !== base) text = applyKey(text, 'parent', basename(dirname(f)))
+    const uuid = basename(f, extname(f))
+    await writeFile(join(completedDir, `${isUuid(uuid) ? uuid : randomUUID()}.md`), text, { encoding: 'utf8', flag: 'wx' })
     await unlink(f)
     await rmdir(subtaskDir(f)).catch(() => undefined) // only succeeds when empty
   }
   await walk(file)
 }
 
-/** Delete completed TODOs that were completed more than 30 days ago. Runs once at startup. */
-let completedPurged = false
+/** UUIDs mentioned as `[[todo:UUID]]` anywhere in the documents folder (hidden folders included). */
+async function collectTodoRefs(root: string): Promise<Set<string>> {
+  const refs = new Set<string>()
+  const walk = async (dir: string): Promise<void> => {
+    let entries
+    try {
+      entries = await readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      const full = join(dir, e.name)
+      if (e.isDirectory()) {
+        if (!IGNORED_DIRS.has(e.name) && !e.name.startsWith(`${TODO_DIR}-backup-`)) await walk(full)
+      } else if (e.isFile() && MD_EXTS.has(extname(e.name).toLowerCase())) {
+        const text = await readFile(full, 'utf8').catch(() => '')
+        for (const m of text.matchAll(/\[\[todo:([0-9a-f-]{36})/gi)) refs.add(m[1].toLowerCase())
+      }
+    }
+  }
+  await walk(root)
+  return refs
+}
+
+/**
+ * Delete completed TODOs older than 30 days (by their `completed:` date, else the file's mtime),
+ * unless some document still refers to them with `[[todo:UUID]]`. Runs once at startup.
+ */
 async function purgeCompleted(root: string): Promise<void> {
   const dir = join(root, TODO_DIR, COMPLETED_DIR)
   const now = Date.now()
+  const expired: string[] = []
   for (const item of await listMarkdown(dir)) {
     try {
-      if (now - (await stat(item.id)).mtimeMs > COMPLETED_TTL_MS) await unlink(item.id)
+      const done = parseKey(await readFile(item.id, 'utf8'), 'completed')
+      const at = done && /^\d{4}-\d{2}-\d{2}$/.test(done) ? new Date(`${done}T00:00:00`).getTime() : (await stat(item.id)).mtimeMs
+      if (now - at > COMPLETED_TTL_MS) expired.push(item.id)
     } catch {
-      // ignore files that vanish or cannot be removed
+      // ignore files that vanish
     }
   }
-}
-
-/** The folder that holds a TODO's subtasks: same path without `.md`. */
-function subtaskDir(todoPath: string): string {
-  return join(dirname(todoPath), basename(todoPath, extname(todoPath)))
-}
-
-async function listMarkdown(dir: string): Promise<TodoItem[]> {
-  let entries
-  try {
-    entries = await readdir(dir, { withFileTypes: true })
-  } catch {
-    return []
+  if (expired.length === 0) return
+  const refs = await collectTodoRefs(root)
+  for (const f of expired) {
+    if (refs.has(basename(f, extname(f)).toLowerCase())) continue
+    await unlink(f).catch(() => undefined)
   }
-  return entries
-    .filter((e) => e.isFile() && !e.name.startsWith('.') && MD_EXTS.has(extname(e.name).toLowerCase()))
-    .map((e) => ({ id: join(dir, e.name), name: basename(e.name, extname(e.name)) }))
-    .sort((a, b) => a.name.localeCompare(b.name, 'ja', { numeric: true }))
+}
+
+/** True when `dir` (below `.todo`) still holds Markdown files whose names are not UUIDs. */
+async function hasLegacyTodos(dir: string): Promise<boolean> {
+  const entries = await readdir(dir, { withFileTypes: true }).catch(() => [])
+  for (const e of entries) {
+    if (e.name.startsWith('.')) continue
+    if (e.isFile() && MD_EXTS.has(extname(e.name).toLowerCase())) {
+      if (!isUuid(basename(e.name, extname(e.name)))) return true
+    } else if (e.isDirectory() && (await hasLegacyTodos(join(dir, e.name)))) return true
+  }
+  return false
+}
+
+/** Rename `<title>.md` (and its subtask folder `<title>/`) to UUIDs; the old name becomes the `# title`. */
+async function migrateTodoDir(dir: string): Promise<void> {
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    if (e.name.startsWith('.') || !e.isFile() || !MD_EXTS.has(extname(e.name).toLowerCase())) continue
+    const oldBase = basename(e.name, extname(e.name))
+    if (isUuid(oldBase)) continue
+    const id = randomUUID()
+    const oldFile = join(dir, e.name)
+    const oldSub = join(dir, oldBase)
+    if ((await stat(oldSub).catch(() => null))?.isDirectory()) await rename(oldSub, join(dir, id))
+    const { front, body } = splitFrontmatter(await readFile(oldFile, 'utf8'))
+    await writeFile(join(dir, `${id}.md`), `${front}# ${oldBase}\n\n${body}`, { encoding: 'utf8', flag: 'wx' })
+    await unlink(oldFile)
+  }
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    if (e.isDirectory() && !e.name.startsWith('.')) await migrateTodoDir(join(dir, e.name))
+  }
+}
+
+/** One-time conversion of title-named TODO files; a copy of `.todo` is kept next to it first. */
+async function migrateTodos(root: string): Promise<void> {
+  const dir = join(root, TODO_DIR)
+  if (!(await hasLegacyTodos(dir))) return
+  const d = new Date()
+  const stamp = `${localYmd(d).replace(/-/g, '')}-${String(d.getHours()).padStart(2, '0')}${String(d.getMinutes()).padStart(2, '0')}${String(d.getSeconds()).padStart(2, '0')}`
+  await cp(dir, join(root, `${TODO_DIR}-backup-${stamp}`), { recursive: true })
+  await migrateTodoDir(dir)
+}
+
+// ---------------------------------------------------------------------------
+// Daily documents: <root>/.daily/YYYY/MM/DD.md
+// ---------------------------------------------------------------------------
+const DAILY_DIR = '.daily'
+
+/** Path of the daily document of `date` (`YYYY-MM-DD`, a real calendar date). */
+function dailyFile(st: WindowState, date: unknown): string {
+  if (!st.root) throw new Error('documents folder is not set')
+  const m = typeof date === 'string' ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(date) : null
+  if (!m) throw new Error('invalid date')
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]))
+  if (d.getUTCFullYear() !== +m[1] || d.getUTCMonth() !== +m[2] - 1 || d.getUTCDate() !== +m[3]) throw new Error('invalid date')
+  return join(st.root, DAILY_DIR, m[1], m[2], `${m[3]}.md`)
+}
+
+async function listDailyDates(root: string): Promise<string[]> {
+  const dates: string[] = []
+  const base = join(root, DAILY_DIR)
+  const names = async (dir: string): Promise<string[]> => readdir(dir).catch(() => [] as string[])
+  for (const y of await names(base)) {
+    if (!/^\d{4}$/.test(y)) continue
+    for (const mo of await names(join(base, y))) {
+      if (!/^\d{2}$/.test(mo)) continue
+      for (const f of await names(join(base, y, mo))) {
+        const d = /^(\d{2})\.md$/.exec(f)
+        if (d) dates.push(`${y}-${mo}-${d[1]}`)
+      }
+    }
+  }
+  return dates.sort().reverse()
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +409,9 @@ function expandPath(p: string): string {
 }
 
 /** Read the config and, if it names a valid documents folder, grant it to this window and scan it. */
+let todoMigration: Promise<void> | null = null
+let completedPurge: Promise<void> | null = null
+
 async function loadWorkspace(st: WindowState): Promise<WorkspaceInfo> {
   const base = { configPath, configuredPath: null as string | null }
   let text: string
@@ -248,10 +428,10 @@ async function loadWorkspace(st: WindowState): Promise<WorkspaceInfo> {
   try {
     if (!(await stat(root)).isDirectory()) return { ...info, folder: null, problem: 'not-found' }
     st.root = root
-    if (!completedPurged) {
-      completedPurged = true
-      void purgeCompleted(root).catch(() => undefined)
-    }
+    // Once per run: convert legacy TODO files (awaited, so the lists see the result), then purge old ones.
+    todoMigration ??= migrateTodos(root).catch((err) => console.error('TODO migration failed:', err))
+    await todoMigration
+    completedPurge ??= todoMigration.then(() => purgeCompleted(root)).catch(() => undefined)
     return { ...info, folder: { root, tree: await scanTree(root) }, problem: null }
   } catch {
     return { ...info, folder: null, problem: 'not-found' }
@@ -477,25 +657,47 @@ function registerIpc(): void {
     return true
   })
 
+  // ---- Daily documents ------------------------------------------------------
+  ipcMain.handle('daily:list', (e): Promise<string[]> => {
+    const st = stateOf(e.sender)
+    return st.root ? listDailyDates(st.root) : Promise.resolve([])
+  })
+
+  ipcMain.handle('daily:open', async (e, date: unknown): Promise<string> => {
+    const file = dailyFile(stateOf(e.sender), date)
+    if (!(await exists(file))) {
+      await mkdir(dirname(file), { recursive: true })
+      await writeFile(file, `# ${date as string}\n\n`, { encoding: 'utf8', flag: 'wx' }).catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== 'EEXIST') throw err
+      })
+    }
+    return file
+  })
+
   // ---- TODOs -----------------------------------------------------------------
   ipcMain.handle('todo:list', (e): Promise<TodoItem[]> => {
     const st = stateOf(e.sender)
-    return st.root ? listMarkdown(todoRoot(st)) : Promise.resolve([])
+    return st.root ? listTodoEntries(todoRoot(st)) : Promise.resolve([])
   })
 
   ipcMain.handle('todo:subtasks', (e, todoPath: unknown): Promise<TodoItem[]> => {
-    return listMarkdown(subtaskDir(assertTodoPath(stateOf(e.sender), todoPath)))
+    return listMarkdown(subtaskDir(assertTodoPath(stateOf(e.sender), todoPath)), true)
   })
 
   ipcMain.handle('todo:create', async (e, parent: unknown, title: unknown): Promise<string> => {
     const st = stateOf(e.sender)
     const dir = parent === null ? todoRoot(st) : subtaskDir(assertTodoPath(st, parent))
-    const name = assertTodoName(title)
-    const target = join(dir, `${name}.md`)
-    if (await exists(target)) throw new Error(`「${name}」はすでに存在します。`)
+    const name = assertTitle(title)
+    const target = join(dir, `${randomUUID()}.md`) // the UUID is the TODO's key; the title lives in the file
     await mkdir(dir, { recursive: true })
-    await writeFile(target, '', { encoding: 'utf8', flag: 'wx' })
+    await writeFile(target, `# ${name}\n\n`, { encoding: 'utf8', flag: 'wx' })
     return target
+  })
+
+  ipcMain.handle('todo:setDue', async (e, todoPath: unknown, due: unknown): Promise<void> => {
+    const file = assertTodoPath(stateOf(e.sender), todoPath)
+    if (due !== null && !isDueString(due)) throw new Error('invalid date')
+    await writeFile(file, applyDue(await readFile(file, 'utf8'), due), 'utf8')
   })
 
   ipcMain.handle('todo:complete', async (e, todoPath: unknown): Promise<boolean> => {
@@ -509,7 +711,7 @@ function registerIpc(): void {
         buttons: ['サブタスクも完了する', 'キャンセル'],
         defaultId: 1,
         cancelId: 1,
-        message: `「${basename(file, extname(file))}」には未完了のサブタスクが ${n} 件あります。`,
+        message: `「${await titleOf(file)}」には未完了のサブタスクが ${n} 件あります。`,
         detail: 'サブタスクも完了してよいですか?'
       }
       const res = win ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts)
@@ -519,18 +721,16 @@ function registerIpc(): void {
     return true
   })
 
-  ipcMain.handle('todo:rename', async (e, todoPath: unknown, newName: unknown): Promise<string> => {
+  // Renaming only rewrites the title heading: the file (and so the TODO's key) stays where it is.
+  ipcMain.handle('todo:rename', async (e, todoPath: unknown, newTitle: unknown): Promise<string> => {
     const file = assertTodoPath(stateOf(e.sender), todoPath)
-    const name = assertTodoName(newName)
-    const dest = join(dirname(file), `${name}.md`)
-    if (dest === file) return file
-    const dir = subtaskDir(file)
-    const destDir = join(dirname(file), name)
-    const caseOnly = dest.toLowerCase() === file.toLowerCase()
-    if (!caseOnly && ((await exists(dest)) || (await exists(destDir)))) throw new Error(`「${name}」はすでに存在します。`)
-    await rename(file, dest)
-    if (await exists(dir)) await rename(dir, destDir)
-    return dest
+    await writeFile(file, applyTitle(await readFile(file, 'utf8'), assertTitle(newTitle)), 'utf8')
+    return file
+  })
+
+  ipcMain.handle('todo:index', (e): Promise<TodoRef[]> => {
+    const st = stateOf(e.sender)
+    return st.root ? listAllTodos(st.root) : Promise.resolve([])
   })
 
   ipcMain.handle('todo:trash', async (e, todoPath: unknown): Promise<boolean> => {
@@ -542,7 +742,7 @@ function registerIpc(): void {
       buttons: ['ゴミ箱に移動', 'キャンセル'],
       defaultId: 1,
       cancelId: 1,
-      message: `TODO「${basename(file, extname(file))}」をゴミ箱に移動しますか?`,
+      message: `TODO「${await titleOf(file)}」をゴミ箱に移動しますか?`,
       detail: 'サブタスクもまとめて移動されます。'
     }
     const res = win ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts)

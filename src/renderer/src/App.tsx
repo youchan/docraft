@@ -2,9 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Editor, type EditorHandle } from './Editor'
 import { FileTree } from './FileTree'
 import { readmeText } from './welcome'
+import { Calendar, DailyList } from './Daily'
+import { today } from './dueFormat'
 import { SubtaskBar, TodoList } from './Todo'
-import { buildLinkIndex } from './links'
-import type { MenuCommand, TodoItem, TreeEntry } from '../../shared/api'
+import { applyDue, applyTitle, parseDue, parseTitle } from '../../shared/frontmatter'
+import { buildLinkIndex, type LinkSuggestion } from './links'
+import type { MenuCommand, TodoItem, TodoRef, TreeEntry } from '../../shared/api'
 
 const api = window.docraft
 
@@ -50,6 +53,8 @@ export function App() {
   const [currentPath, setCurrentPath] = useState<string | null>(null)
   // 'none': nothing open · 'readme': read-only guide (never saved) · 'file': an editable file on disk
   const [mode, setMode] = useState<'none' | 'readme' | 'file'>('none')
+  const [openDue, setOpenDue] = useState<string | null>(null) // due date of the open file
+  const [openTitle, setOpenTitle] = useState<string | null>(null) // first heading of the open file
   const [dirty, setDirtyState] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth)
 
@@ -73,12 +78,6 @@ export function App() {
     setDirtyState(value)
     api.setDirty(value)
   }, [])
-
-  // ---- Window title -------------------------------------------------------
-  const name = currentPath ? baseName(currentPath) : mode === 'readme' ? 'README' : 'Docraft'
-  useEffect(() => {
-    document.title = `${dirty ? '● ' : ''}${name} — Docraft`
-  }, [name, dirty])
 
   // ---- Folder -------------------------------------------------------------
   // The documents folder comes from ~/.docraft/config.toml. Without one, show the in-app README.
@@ -110,6 +109,8 @@ export function App() {
       currentPathRef.current = path
       setCurrentPath(path)
       setMode('file')
+      setOpenDue(parseDue(content))
+      setOpenTitle(parseTitle(content))
       editorRef.current?.setDoc(content)
       clearAutosaveTimer()
       setDirty(false)
@@ -137,6 +138,8 @@ export function App() {
     currentPathRef.current = null
     setCurrentPath(null)
     setMode('none')
+    setOpenDue(null)
+    setOpenTitle(null)
     editorRef.current?.setDoc('')
     setDirty(false)
   }, [clearAutosaveTimer, setDirty])
@@ -151,11 +154,19 @@ export function App() {
     }
   }, [flushSave])
 
+  // Set later (TODO section): refresh the TODO lists after a save, since the file may have changed its due date.
+  const afterAutosaveRef = useRef<() => void>(() => undefined)
+
   const onDocChange = useCallback(() => {
     setDirty(true)
+    const text = editorRef.current?.getDoc() ?? ''
+    setOpenDue(parseDue(text))
+    setOpenTitle(parseTitle(text))
     clearAutosaveTimer()
     autosaveTimer.current = setTimeout(() => {
-      flushSave().catch((err) => console.error('autosave failed', err))
+      flushSave()
+        .then(() => afterAutosaveRef.current())
+        .catch((err) => console.error('autosave failed', err))
     }, AUTOSAVE_DELAY_MS)
   }, [setDirty, clearAutosaveTimer, flushSave])
 
@@ -213,12 +224,25 @@ export function App() {
   const [subtasks, setSubtasks] = useState<TodoItem[]>([])
   const root = folder?.root ?? null
   const todoPrefix = root ? `${root}${root.includes('\\') ? '\\' : '/'}.todo${root.includes('\\') ? '\\' : '/'}` : null
-  const inTodo = !!(todoPrefix && currentPath && currentPath.startsWith(todoPrefix) && currentPath.toLowerCase().endsWith('.md'))
+  const completedPrefix = todoPrefix ? `${todoPrefix}.completed${todoPrefix.endsWith('\\') ? '\\' : '/'}` : null
+  const inTodoDir = !!(todoPrefix && currentPath && currentPath.startsWith(todoPrefix) && currentPath.toLowerCase().endsWith('.md'))
+  const inCompleted = !!(completedPrefix && currentPath?.startsWith(completedPrefix))
+  const inTodo = inTodoDir && !inCompleted // an open (not completed) TODO or subtask
+
+  // ---- Window title: TODOs are named by their title (their file name is a UUID) ----
+  const name = inTodoDir ? (openTitle ?? '無題') : currentPath ? baseName(currentPath) : mode === 'readme' ? 'README' : 'Docraft'
+  useEffect(() => {
+    document.title = `${dirty ? '● ' : ''}${name} — Docraft`
+  }, [name, dirty])
+
   const report = (err: unknown): void => alert(`エラー: ${err instanceof Error ? err.message : String(err)}`)
 
+  const [todoRefs, setTodoRefs] = useState<TodoRef[]>([])
   const refreshTodos = useCallback(async () => {
     if (!folderRootRef.current) return
-    setTodos(await api.listTodos())
+    const [list, refs] = await Promise.all([api.listTodos(), api.listAllTodos()])
+    setTodos(list)
+    setTodoRefs(refs)
   }, [])
 
   const refreshSubtasks = useCallback(async () => {
@@ -241,7 +265,28 @@ export function App() {
 
   useEffect(() => {
     void refreshSubtasks().catch(() => setSubtasks([]))
-  }, [currentPath, inTodo, refreshSubtasks])
+    void refreshTodos().catch(() => undefined)
+  }, [currentPath, inTodo, refreshSubtasks, refreshTodos])
+
+  afterAutosaveRef.current = () => {
+    if (!inTodoRef.current) return
+    void refreshTodos().catch(() => undefined)
+    void refreshSubtasks().catch(() => undefined)
+  }
+
+  const setTodoDue = useCallback(
+    async (path: string, due: string | null) => {
+      if (path === currentPathRef.current && editorRef.current) {
+        // Open in the editor: edit the text there (autosave writes it) so nothing is overwritten.
+        editorRef.current.replaceDoc(applyDue(editorRef.current.getDoc(), due))
+        await flushSave()
+      } else {
+        await api.setTodoDue(path, due)
+      }
+      await Promise.all([refreshTodos(), refreshSubtasks()])
+    },
+    [flushSave, refreshTodos, refreshSubtasks]
+  )
 
   const createTodo = useCallback(
     async (parent: string | null, title: string) => {
@@ -269,19 +314,16 @@ export function App() {
     [flushSave, closeDocument, refreshTodos, refreshSubtasks]
   )
 
+  /** Rename = change the title heading. The file keeps its UUID name, so references stay valid. */
   const renameTodo = useCallback(
     async (path: string, title: string) => {
       await flushSave()
-      const next = await api.renameTodo(path, title)
-      if (next === path) return
-      const moved = { [path]: next, [path.replace(/\.md$/i, '')]: next.replace(/\.md$/i, '') }
-      const cur = currentPathRef.current
-      if (cur) {
-        const mapped = remapPath(cur, moved)
-        if (mapped !== cur) {
-          currentPathRef.current = mapped
-          setCurrentPath(mapped)
-        }
+      if (path === currentPathRef.current && editorRef.current) {
+        // Open in the editor: edit the text there (autosave writes it) so nothing is overwritten.
+        editorRef.current.replaceDoc(applyTitle(editorRef.current.getDoc(), title))
+        await flushSave()
+      } else {
+        await api.renameTodo(path, title)
       }
       await Promise.all([refreshTodos(), refreshSubtasks()])
     },
@@ -300,18 +342,81 @@ export function App() {
     [flushSave, closeDocument, refreshTodos, refreshSubtasks]
   )
 
+  // ---- Daily documents (<root>/.daily/YYYY/MM/DD.md) -----------------------------
+  const [dailyDates, setDailyDates] = useState<string[]>([])
+  const [calendarOpen, setCalendarOpen] = useState(false)
+
+  const refreshDaily = useCallback(async () => {
+    if (!folderRootRef.current) return
+    setDailyDates(await api.listDaily())
+  }, [])
+
+  useEffect(() => {
+    void refreshDaily().catch(() => undefined)
+    window.addEventListener('focus', refreshDaily as () => void)
+    return () => window.removeEventListener('focus', refreshDaily as () => void)
+  }, [root, refreshDaily])
+
+  // Opening any document (e.g. from the sidebar) dismisses the calendar.
+  useEffect(() => setCalendarOpen(false), [currentPath])
+
+  const openDay = useCallback(
+    async (date: string) => {
+      const path = await api.openDaily(date) // creates the document when it does not exist yet
+      await openPath(path)
+      setCalendarOpen(false)
+      await refreshDaily()
+    },
+    [openPath, refreshDaily]
+  )
+
+  // The date of the open document when it is a daily document.
+  const activeDate = (() => {
+    const m = currentPath ? /[\\/]\.daily[\\/](\d{4})[\\/](\d{2})[\\/](\d{2})\.md$/.exec(currentPath) : null
+    return m && root && currentPath?.startsWith(root) ? `${m[1]}-${m[2]}-${m[3]}` : null
+  })()
+
   // ---- Wiki links ([[name]]) ------------------------------------------------
   const linkIndex = useMemo(() => (folder ? buildLinkIndex(folder.root, folder.tree) : null), [folder])
+  // `[[todo:UUID]]` points at a TODO by its key; everything else is a document name.
+  const todoByUuid = useMemo(() => new Map(todoRefs.map((r) => [r.uuid.toLowerCase(), r])), [todoRefs])
+  const todoOf = useCallback(
+    (name: string): TodoRef | null => {
+      const m = /^todo:\s*([0-9a-f-]{36})$/i.exec(name.trim())
+      return m ? (todoByUuid.get(m[1].toLowerCase()) ?? null) : null
+    },
+    [todoByUuid]
+  )
   const resolveLink = useCallback(
-    (name: string) => linkIndex?.resolve(name, currentPath) ?? null,
-    [linkIndex, currentPath]
+    (name: string) => (/^todo:/i.test(name.trim()) ? (todoOf(name)?.id ?? null) : (linkIndex?.resolve(name, currentPath) ?? null)),
+    [linkIndex, currentPath, todoOf]
+  )
+  const todoInfo = useCallback(
+    (uuid: string) => {
+      const r = todoByUuid.get(uuid.toLowerCase())
+      return r ? { title: r.title, completed: r.completed } : null
+    },
+    [todoByUuid]
+  )
+  const searchLinks = useCallback(
+    (q: string): LinkSuggestion[] => {
+      const norm = (t: string): string => t.normalize('NFC').toLowerCase()
+      const todoOnly = /^todo:/i.test(q.trim())
+      const query = norm(todoOnly ? q.trim().slice(5).trim() : q.trim())
+      const todos = todoRefs
+        .filter((r) => norm(r.title).startsWith(query))
+        .sort((a, b) => Number(a.completed) - Number(b.completed) || a.title.localeCompare(b.title, 'ja', { numeric: true }))
+        .map((r) => ({ name: r.title, folder: r.completed ? 'TODO(完了)' : 'TODO', insert: `todo:${r.uuid}` }))
+      return (todoOnly ? todos : [...(linkIndex?.search(q) ?? []), ...todos]).slice(0, 50)
+    },
+    [linkIndex, todoRefs]
   )
   const onOpenLink = useCallback(
     (name: string) => {
-      const target = linkIndex?.resolve(name, currentPathRef.current)
+      const target = resolveLink(name)
       if (target) void openPath(target).catch((err) => alert(`エラー: ${err instanceof Error ? err.message : String(err)}`))
     },
-    [linkIndex, openPath]
+    [resolveLink, openPath]
   )
 
   // ---- Tree callbacks -----------------------------------------------------
@@ -371,6 +476,12 @@ export function App() {
         {folder && (
           <>
             <div id="sidebar-wrap" style={{ width: sidebarWidth }}>
+              <DailyList
+                dates={dailyDates}
+                activeDate={activeDate}
+                onOpen={(d) => void openDay(d).catch(report)}
+                onOpenCalendar={() => setCalendarOpen(true)}
+              />
               <TodoList
                 items={todos}
                 activePath={currentPath}
@@ -378,6 +489,7 @@ export function App() {
                 onCreate={(t) => void createTodo(null, t).catch(report)}
                 onComplete={(p) => void completeTodo(p).catch(report)}
                 onRename={(p, t) => void renameTodo(p, t).catch(report)}
+                onSetDue={(p, d) => void setTodoDue(p, d).catch(report)}
                 onTrash={(p) => void trashTodo(p).catch(report)}
               />
               <FileTree
@@ -394,14 +506,25 @@ export function App() {
           </>
         )}
         <div id="editor-col">
+        {calendarOpen && (
+          <Calendar
+            dates={dailyDates}
+            activeDate={activeDate ?? today()}
+            onOpen={(d) => void openDay(d).catch(report)}
+            onClose={() => setCalendarOpen(false)}
+          />
+        )}
         {inTodo && currentPath && (
           <SubtaskBar
-            title={baseName(currentPath).replace(/\.md$/i, '')}
+            title={openTitle ?? '無題'}
             items={subtasks}
             onOpen={(p) => void openPath(p).catch(report)}
             onCreate={(t) => void createTodo(currentPath, t).catch(report)}
             onComplete={(p) => void completeTodo(p).catch(report)}
             onRename={(p, t) => void renameTodo(p, t).catch(report)}
+            onSetDue={(p, d) => void setTodoDue(p, d).catch(report)}
+            due={openDue}
+            onSetOwnDue={(d) => void setTodoDue(currentPath, d).catch(report)}
             onOpenParent={
               dirName(currentPath) !== todoPrefix?.slice(0, -1)
                 ? () => void openPath(dirName(currentPath) + '.md').catch(report)
@@ -418,6 +541,8 @@ export function App() {
           onDocChange={onDocChange}
           resolveLink={resolveLink}
           onOpenLink={onOpenLink}
+          searchLinks={searchLinks}
+          todoInfo={todoInfo}
         />
         </div>
       </div>

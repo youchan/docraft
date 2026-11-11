@@ -2,19 +2,23 @@ import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react'
 import { EditorState } from '@codemirror/state'
 import { EditorView, drawSelection, dropCursor, highlightSpecialChars, keymap } from '@codemirror/view'
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
-import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete'
+import { autocompletion, closeBrackets, closeBracketsKeymap, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete'
 import { bracketMatching, indentOnInput, syntaxHighlighting } from '@codemirror/language'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { languages } from '@codemirror/language-data'
 import { highlightSelectionMatches, search, searchKeymap } from '@codemirror/search'
 import { livePreview, refreshLinks } from './editor/livePreview'
+import { frontmatterStyle, movePastFrontmatter, replaceWholeDoc } from './editor/frontmatter'
 import { tables } from './editor/tables'
+import type { LinkSuggestion } from './links'
 import { docraftHighlight } from './editor/highlight'
 
 export interface EditorHandle {
   getDoc(): string
   /** Replace the whole document (resets undo history). Does not fire onDocChange. */
   setDoc(content: string, opts?: { readOnly?: boolean }): void
+  /** Replace the whole text with a minimal edit (keeps cursor and undo history). Fires onDocChange. */
+  replaceDoc(content: string): void
   focus(): void
 }
 
@@ -26,6 +30,10 @@ interface Props {
   /** Path of the file `[[name]]` points to, or null. Changing identity redraws the links. */
   resolveLink: (name: string) => string | null
   onOpenLink: (name: string) => void
+  /** Files for `[[` completion (name prefix match). */
+  searchLinks: (query: string) => LinkSuggestion[]
+  /** Title and state of the TODO with this UUID (for `[[todo:UUID]]`), or null. */
+  todoInfo: (uuid: string) => { title: string; completed: boolean } | null
   /** Hide the editor (no document open). */
   hidden?: boolean
 }
@@ -35,7 +43,34 @@ interface Hooks {
   onChange: () => void
   isLinkResolved: (name: string) => boolean
   openLink: (name: string) => void
+  searchLinks: (query: string) => LinkSuggestion[]
+  todoInfo: (uuid: string) => { title: string; completed: boolean } | null
   openUrl: (url: string) => void
+}
+
+/** `[[` completion: documents whose name starts with what has been typed; picking one inserts `name]]`. */
+function wikiLinkSource(hooks: Hooks) {
+  return (ctx: CompletionContext): CompletionResult | null => {
+    const m = ctx.matchBefore(/\[\[[^\]\n|]*/)
+    if (!m) return null
+    const from = m.from + 2
+    const options = hooks.searchLinks(ctx.state.sliceDoc(from, ctx.pos)).map((s) => ({
+      label: s.name,
+      detail: s.folder,
+      type: 'text',
+      apply: (view: EditorView, _c: unknown, f: number, t: number): void => {
+        // closeBrackets has usually already added the `]]`; do not duplicate it.
+        const text = s.insert ?? s.name
+        const hasClose = view.state.sliceDoc(t, t + 2) === ']]'
+        view.dispatch({
+          changes: { from: f, to: t, insert: text + (hasClose ? '' : ']]') },
+          selection: { anchor: f + text.length + 2 },
+          userEvent: 'input.complete'
+        })
+      }
+    }))
+    return { from, options, filter: false }
+  }
 }
 
 function createState(doc: string, hooks: Hooks, readOnly: boolean): EditorState {
@@ -51,6 +86,7 @@ function createState(doc: string, hooks: Hooks, readOnly: boolean): EditorState 
       bracketMatching(),
       // Typing an opening bracket inserts the closing one after the caret.
       closeBrackets(),
+      autocompletion({ override: [wikiLinkSource(hooks)], icons: false }),
       EditorState.languageData.of(() => [{ closeBrackets: { brackets: ['(', '[', '{', '「', '『', '（', '【'] } }]),
       search({ top: true }),
       highlightSelectionMatches(),
@@ -58,8 +94,15 @@ function createState(doc: string, hooks: Hooks, readOnly: boolean): EditorState 
       markdown({ base: markdownLanguage, codeLanguages: languages }),
       syntaxHighlighting(docraftHighlight),
       EditorView.lineWrapping,
-      livePreview({ baseDir: hooks.getBaseDir, isLinkResolved: hooks.isLinkResolved, openLink: hooks.openLink, openUrl: hooks.openUrl }),
+      livePreview({
+        baseDir: hooks.getBaseDir,
+        isLinkResolved: hooks.isLinkResolved,
+        openLink: hooks.openLink,
+        todoInfo: hooks.todoInfo,
+        openUrl: hooks.openUrl
+      }),
       tables(),
+      frontmatterStyle(),
       EditorView.updateListener.of((u) => {
         if (u.docChanged) hooks.onChange()
       })
@@ -67,7 +110,7 @@ function createState(doc: string, hooks: Hooks, readOnly: boolean): EditorState 
   })
 }
 
-export const Editor = forwardRef<EditorHandle, Props>(function Editor({ initialDoc, baseDir, onDocChange, resolveLink, onOpenLink, hidden }, ref) {
+export const Editor = forwardRef<EditorHandle, Props>(function Editor({ initialDoc, baseDir, onDocChange, resolveLink, onOpenLink, searchLinks, todoInfo, hidden }, ref) {
   const hostRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
   // Latest props, readable from CodeMirror callbacks without recreating the editor.
@@ -75,10 +118,14 @@ export const Editor = forwardRef<EditorHandle, Props>(function Editor({ initialD
   const onChangeRef = useRef(onDocChange)
   const resolveLinkRef = useRef(resolveLink)
   const onOpenLinkRef = useRef(onOpenLink)
+  const searchLinksRef = useRef(searchLinks)
+  const todoInfoRef = useRef(todoInfo)
   baseDirRef.current = baseDir
   onChangeRef.current = onDocChange
   resolveLinkRef.current = resolveLink
   onOpenLinkRef.current = onOpenLink
+  searchLinksRef.current = searchLinks
+  todoInfoRef.current = todoInfo
 
   const make = (doc: string, readOnly = false): EditorState =>
     createState(
@@ -88,6 +135,8 @@ export const Editor = forwardRef<EditorHandle, Props>(function Editor({ initialD
       onChange: () => onChangeRef.current(),
       isLinkResolved: (name) => resolveLinkRef.current(name) !== null,
       openLink: (name) => onOpenLinkRef.current(name),
+      searchLinks: (q) => searchLinksRef.current(q),
+      todoInfo: (uuid) => todoInfoRef.current(uuid),
       openUrl: (url) => void window.docraft.openExternal(url).catch(() => undefined)
       },
       readOnly
@@ -116,7 +165,16 @@ export const Editor = forwardRef<EditorHandle, Props>(function Editor({ initialD
       const view = viewRef.current
       if (!view) return
       view.setState(make(content, opts?.readOnly ?? false))
-      if (!opts?.readOnly) view.focus()
+      if (!opts?.readOnly) {
+        movePastFrontmatter(view)
+        view.focus()
+      }
+    },
+    replaceDoc: (content) => {
+      const view = viewRef.current
+      if (!view) return
+      replaceWholeDoc(view, content)
+      movePastFrontmatter(view)
     },
     focus: () => viewRef.current?.focus()
   }))

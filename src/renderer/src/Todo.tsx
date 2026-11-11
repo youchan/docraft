@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { isOverdue, shortDate } from './dueFormat'
 import type { TodoItem } from '../../shared/api'
 
 /** Inline title input (new or rename). Enter adds, Escape/blur cancels. */
@@ -34,6 +35,62 @@ function AddInput({
   )
 }
 
+/** Due date of a TODO: a badge that turns into a date input when clicked (clear the field to remove it). */
+function DueBadge({
+  due,
+  onChange,
+  showEmpty = false
+}: {
+  due: string | null
+  onChange: (due: string | null) => void
+  /** Keep an unset badge visible ("期限を設定") instead of showing it only on hover. */
+  showEmpty?: boolean
+}) {
+  const [editing, setEditing] = useState(false)
+  if (editing) {
+    return (
+      <input
+        type="date"
+        className="due-input"
+        autoFocus
+        defaultValue={due ?? ''}
+        onClick={(e) => e.stopPropagation()}
+        onDoubleClick={(e) => e.stopPropagation()}
+        onBlur={() => setEditing(false)}
+        onChange={(e) => {
+          // A complete date (or an empty field) is a final value; partial typing yields ''.
+          onChange(e.currentTarget.value || null)
+          if (e.currentTarget.value) setEditing(false)
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') setEditing(false)
+          e.stopPropagation()
+        }}
+      />
+    )
+  }
+  const overdue = due !== null && isOverdue(due)
+  return (
+    <button
+      className={`due-badge${due || showEmpty ? '' : ' due-none'}${overdue ? ' due-overdue' : ''}`}
+      title={due ? `期限: ${due}(クリックで変更)` : '期限を設定'}
+      onClick={(e) => {
+        e.stopPropagation()
+        setEditing(true)
+      }}
+      onDoubleClick={(e) => e.stopPropagation()}
+    >
+      {showEmpty && (
+        <svg className="due-icon" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+          <rect x="2" y="3" width="12" height="11" rx="1.5" />
+          <path d="M2 6.5h12M5.5 1.5v3M10.5 1.5v3" />
+        </svg>
+      )}
+      {due ? shortDate(due) : showEmpty ? '期限を設定' : '期限'}
+    </button>
+  )
+}
+
 function PlusIcon() {
   return (
     <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
@@ -50,6 +107,7 @@ export function TodoList({
   onCreate,
   onComplete,
   onRename,
+  onSetDue,
   onTrash
 }: {
   items: TodoItem[]
@@ -58,6 +116,7 @@ export function TodoList({
   onCreate: (title: string) => void
   onComplete: (path: string) => void
   onRename: (path: string, title: string) => void
+  onSetDue: (path: string, due: string | null) => void
   onTrash: (path: string) => void
 }) {
   const [adding, setAdding] = useState(false)
@@ -86,11 +145,11 @@ export function TodoList({
             <AddInput
               key={t.id}
               placeholder="TODOのタイトル"
-              initial={t.name}
+              initial={t.title}
               onCancel={() => setRenaming(null)}
               onSubmit={(title) => {
                 setRenaming(null)
-                if (title !== t.name) onRename(t.id, title)
+                if (title !== t.title) onRename(t.id, title)
               }}
             />
           ) : (
@@ -102,6 +161,7 @@ export function TodoList({
               title="ダブルクリックで名前を変更"
             >
               <span className="todo-name">{t.name}</span>
+              <DueBadge due={t.due} onChange={(d) => onSetDue(t.id, d)} />
               <button
                 className="icon-btn todo-act"
                 title="完了にする"
@@ -139,6 +199,9 @@ export function SubtaskBar({
   onCreate,
   onComplete,
   onRename,
+  onSetDue,
+  due,
+  onSetOwnDue,
   onOpenParent
 }: {
   title: string
@@ -147,6 +210,10 @@ export function SubtaskBar({
   onCreate: (title: string) => void
   onComplete: (path: string) => void
   onRename: (path: string, title: string) => void
+  onSetDue: (path: string, due: string | null) => void
+  /** Due date of the open TODO itself, and how to change it. */
+  due: string | null
+  onSetOwnDue: (due: string | null) => void
   /** Present when the open TODO is itself a subtask. */
   onOpenParent: (() => void) | null
 }) {
@@ -161,6 +228,8 @@ export function SubtaskBar({
           </button>
         )}
         <span className="subtask-title">{title} のサブタスク</span>
+        <span className="subtask-spacer" />
+        <DueBadge due={due} onChange={onSetOwnDue} showEmpty />
         <button className="icon-btn" title="サブタスクを追加" onClick={() => setAdding(true)}>
           <PlusIcon />
         </button>
@@ -183,6 +252,7 @@ export function SubtaskBar({
               <button className="subtask-name" onClick={() => onOpen(t.id)} onDoubleClick={() => setRenaming(t.id)}>
                 {t.name}
               </button>
+              <DueBadge due={t.due} onChange={(d) => onSetDue(t.id, d)} />
               <button className="subtask-done" title="完了にする" onClick={() => onComplete(t.id)}>
                 ✓
               </button>
