@@ -666,8 +666,16 @@ function registerIpc(): void {
   ipcMain.handle('daily:open', async (e, date: unknown): Promise<string> => {
     const file = dailyFile(stateOf(e.sender), date)
     if (!(await exists(file))) {
+      let content = `# ${date as string}\n\n`
+      // A new document for today lists the open TODOs that are due today or earlier (as `[[todo:UUID]]`).
+      if (date === localYmd()) {
+        const due = (await listAllTodos(stateOf(e.sender).root as string))
+          .filter((t) => !t.completed && t.due !== null && t.due <= (date as string))
+          .sort((a, b) => (a.due as string).localeCompare(b.due as string) || a.title.localeCompare(b.title, 'ja', { numeric: true }))
+        if (due.length > 0) content += `## 期限のTODO\n\n${due.map((t) => `- [[todo:${t.uuid}]]`).join('\n')}\n\n`
+      }
       await mkdir(dirname(file), { recursive: true })
-      await writeFile(file, `# ${date as string}\n\n`, { encoding: 'utf8', flag: 'wx' }).catch((err: NodeJS.ErrnoException) => {
+      await writeFile(file, content, { encoding: 'utf8', flag: 'wx' }).catch((err: NodeJS.ErrnoException) => {
         if (err.code !== 'EEXIST') throw err
       })
     }
