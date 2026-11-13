@@ -804,3 +804,17 @@ body:not(.platform-darwin) #titlebar {
 #editor .cm-md-todolink.cm-md-todolink-done::before {
   content: '☑ ';
 }
+
+.done-btn {
+  border: 1px solid var(--border, #ccc);
+  background: transparent;
+  color: inherit;
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.done-btn:hover {
+  background: rgba(46, 160, 67, 0.15);
+  border-color: rgb(46, 160, 67);
+}

@@ -202,6 +202,7 @@ export function SubtaskBar({
   onSetDue,
   due,
   onSetOwnDue,
+  onCompleteSelf,
   onOpenParent
 }: {
   title: string
@@ -214,6 +215,8 @@ export function SubtaskBar({
   /** Due date of the open TODO itself, and how to change it. */
   due: string | null
   onSetOwnDue: (due: string | null) => void
+  /** Mark the open TODO itself as done. */
+  onCompleteSelf: () => void
   /** Present when the open TODO is itself a subtask. */
   onOpenParent: (() => void) | null
 }) {
@@ -230,6 +233,9 @@ export function SubtaskBar({
         <span className="subtask-title">{title} のサブタスク</span>
         <span className="subtask-spacer" />
         <DueBadge due={due} onChange={onSetOwnDue} showEmpty />
+        <button className="done-btn" title="このTODOを完了にする" onClick={onCompleteSelf}>
+          ✓ 完了
+        </button>
         <button className="icon-btn" title="サブタスクを追加" onClick={() => setAdding(true)}>
           <PlusIcon />
         </button>

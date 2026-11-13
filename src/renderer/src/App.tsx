@@ -387,9 +387,22 @@ export function App() {
     },
     [todoByUuid]
   )
+  // `[[YYYY-MM-DD]]` points at that day's daily document (created on open when missing).
+  const dailyLinkDate = useCallback((name: string): string | null => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(name.trim())
+    if (!m) return null
+    const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])]
+    const dt = new Date(y, mo - 1, d)
+    return dt.getFullYear() === y && dt.getMonth() === mo - 1 && dt.getDate() === d ? name.trim() : null
+  }, [])
   const resolveLink = useCallback(
-    (name: string) => (/^todo:/i.test(name.trim()) ? (todoOf(name)?.id ?? null) : (linkIndex?.resolve(name, currentPath) ?? null)),
-    [linkIndex, currentPath, todoOf]
+    (name: string) => {
+      if (/^todo:/i.test(name.trim())) return todoOf(name)?.id ?? null
+      const date = dailyLinkDate(name)
+      if (date && root) return `${root.replace(/[\\/]+$/, '')}/.daily/${date.slice(0, 4)}/${date.slice(5, 7)}/${date.slice(8, 10)}.md`
+      return linkIndex?.resolve(name, currentPath) ?? null
+    },
+    [linkIndex, currentPath, todoOf, dailyLinkDate, root]
   )
   const todoInfo = useCallback(
     (uuid: string) => {
@@ -413,10 +426,15 @@ export function App() {
   )
   const onOpenLink = useCallback(
     (name: string) => {
+      const date = dailyLinkDate(name)
+      if (date) {
+        void openDay(date).catch((err) => alert(`エラー: ${err instanceof Error ? err.message : String(err)}`))
+        return
+      }
       const target = resolveLink(name)
       if (target) void openPath(target).catch((err) => alert(`エラー: ${err instanceof Error ? err.message : String(err)}`))
     },
-    [resolveLink, openPath]
+    [resolveLink, openPath, dailyLinkDate, openDay]
   )
 
   // ---- Tree callbacks -----------------------------------------------------
@@ -524,6 +542,7 @@ export function App() {
             onRename={(p, t) => void renameTodo(p, t).catch(report)}
             onSetDue={(p, d) => void setTodoDue(p, d).catch(report)}
             due={openDue}
+            onCompleteSelf={() => void completeTodo(currentPath).catch(report)}
             onSetOwnDue={(d) => void setTodoDue(currentPath, d).catch(report)}
             onOpenParent={
               dirName(currentPath) !== todoPrefix?.slice(0, -1)
