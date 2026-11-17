@@ -7,13 +7,15 @@ export interface OpenedFile {
 }
 
 /**
- * A node of the folder tree. `id` is the absolute path.
- * Folders have `children` (possibly empty); files do not.
+ * A page in the document tree. `id` is the absolute path of its file (`A.md`); its children
+ * are the pages in the folder next to it with the same name (`A/`). `name` has no extension.
  */
 export interface TreeEntry {
   id: string
   name: string
-  children?: TreeEntry[]
+  children: TreeEntry[]
+  /** The page has a child folder but no file of its own (yet). */
+  missing?: boolean
 }
 
 export interface OpenedFolder {
@@ -41,10 +43,14 @@ export interface TodoRef {
   title: string
   completed: boolean
   due: string | null
+  /** Completed only: date (`YYYY-MM-DD`) it was completed, or null. */
+  completedAt: string | null
+  /** Completed subtask only: the UUID of its parent TODO, or null. */
+  parent: string | null
 }
 
 /** What the user picked in the file tree's context menu. */
-export type ContextAction = 'newFile' | 'newFolder' | 'rename' | 'reveal' | 'trash'
+export type ContextAction = 'newFile' | 'rename' | 'reveal' | 'trash'
 
 /** Result of reading ~/.docraft/config.toml. */
 export interface WorkspaceInfo {
@@ -75,18 +81,18 @@ export interface DocraftApi {
   loadWorkspace(): Promise<WorkspaceInfo>
   /** Re-scan the granted folder. */
   readTree(root: string): Promise<TreeEntry[]>
-  /** Create an empty Markdown file or folder in `parent`. Resolves the new path. */
-  createEntry(parent: string, kind: 'file' | 'folder'): Promise<string>
-  /** Rename an entry (a file without extension gets `.md`). Resolves the new path. */
+  /** Create an empty page as a child of the page `parent` (or at the top when `parent` is the root). Resolves its path. */
+  createEntry(parent: string, name?: string): Promise<string>
+  /** Rename a page (its child folder follows). Resolves the new path. */
   renameEntry(path: string, newName: string): Promise<string>
-  /** Move entries into `destDir`. Resolves old path -> new path pairs. */
-  moveEntries(paths: string[], destDir: string): Promise<Record<string, string>>
+  /** Move pages (with their children) under the page `destParent` (or the root). Resolves old path -> new path pairs. */
+  moveEntries(paths: string[], destParent: string): Promise<Record<string, string>>
   /**
    * Pop up the native context menu for a tree row (or the empty area = 'root').
-   * `targetFolder` is the name of the folder new items would be created in (shown in the menu).
+   * `targetName` is the name of the page new pages would be created under (shown in the menu).
    * Resolves the chosen action, or null when dismissed.
    */
-  showContextMenu(kind: 'root' | 'folder' | 'file', targetFolder: string): Promise<ContextAction | null>
+  showContextMenu(kind: 'root' | 'file', targetName: string): Promise<ContextAction | null>
   /** Show an entry in the system file manager (Finder). */
   revealEntry(path: string): Promise<void>
   /** Ask for confirmation, then move entries to the trash. Resolves false when cancelled. */
@@ -112,6 +118,11 @@ export interface DocraftApi {
    * completed as well. Resolves false when cancelled.
    */
   completeTodo(todoPath: string): Promise<boolean>
+  /**
+   * Undo a completion: move a completed TODO from `.todo/.completed` back to `.todo` (into its parent's
+   * subtask folder when the parent is still open, else top level). Resolves its new path.
+   */
+  restoreTodo(completedPath: string): Promise<string>
   /** Change the title (first heading) of a TODO or subtask; the file itself is not renamed. Resolves its path. */
   renameTodo(todoPath: string, newName: string): Promise<string>
   /** Ask for confirmation, then move a TODO (and its subtask folder) to the trash. Resolves false when cancelled. */

@@ -23,6 +23,9 @@ function folderName(path: string): string {
   return path.split(/[\\/]/).pop() ?? path
 }
 
+/** A page's child folder: its path without `.md`. */
+const stripExt = (p: string): string => p.replace(/\.(md|markdown)$/i, '')
+
 function useElementHeight<T extends HTMLElement>(): [React.RefObject<T | null>, number] {
   const ref = useRef<T>(null)
   const [height, setHeight] = useState(0)
@@ -84,9 +87,9 @@ export function FileTree({ root, data, activePath, onOpenFile, onRefresh, onPath
     })
   }, [data])
 
-  const create = (parent: string, kind: 'file' | 'folder'): void => {
+  const create = (parent: string): void => {
     void guard(async () => {
-      pendingReveal.current = await api.createEntry(parent, kind)
+      pendingReveal.current = await api.createEntry(parent)
       await onRefresh()
     })
   }
@@ -94,7 +97,7 @@ export function FileTree({ root, data, activePath, onOpenFile, onRefresh, onPath
   const trash = (ids: string[]): void => {
     void guard(async () => {
       if (await api.trashEntries(ids)) {
-        onPathsTrashed(ids)
+        onPathsTrashed([...ids, ...ids.map(stripExt)])
         await onRefresh()
       }
     })
@@ -104,16 +107,13 @@ export function FileTree({ root, data, activePath, onOpenFile, onRefresh, onPath
   const openContextMenu = (node: TreeNode | null): void => {
     const tree = treeRef.current
     if (node) tree?.select(node.id)
-    const parentPath = !node ? root : node.isInternal ? node.id : node.parent && !node.parent.isRoot ? node.parent.id : root
-    const kind = !node ? 'root' : node.isInternal ? 'folder' : 'file'
+    const parentPath = node ? node.id : root
     void guard(async () => {
-      const action: ContextAction | null = await api.showContextMenu(kind, folderName(parentPath))
+      const action: ContextAction | null = await api.showContextMenu(node ? 'file' : 'root', node ? node.data.name : folderName(root))
       if (!action) return
       switch (action) {
         case 'newFile':
-          return create(parentPath, 'file')
-        case 'newFolder':
-          return create(parentPath, 'folder')
+          return create(parentPath)
         case 'rename':
           if (node) void tree?.edit(node)
           return
@@ -138,14 +138,9 @@ export function FileTree({ root, data, activePath, onOpenFile, onRefresh, onPath
         <span className="sidebar-title" title={root}>
           {folderName(root)}
         </span>
-        <button className="icon-btn" title="ルートに新規ファイル" onClick={() => create(root, 'file')}>
+        <button className="icon-btn" title="ルートに新規ページ" onClick={() => create(root)}>
           <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
             <path d="M4 1.5h5l3.5 3.5v9a.5.5 0 0 1-.5.5H4a.5.5 0 0 1-.5-.5v-12A.5.5 0 0 1 4 1.5Z M8.5 7v4 M6.5 9h4" />
-          </svg>
-        </button>
-        <button className="icon-btn" title="ルートに新規フォルダ" onClick={() => create(root, 'folder')}>
-          <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
-            <path d="M1.5 4a.5.5 0 0 1 .5-.5h3.6l1.4 1.5H14a.5.5 0 0 1 .5.5v7a.5.5 0 0 1-.5.5H2a.5.5 0 0 1-.5-.5Z M8 7.5v3.5 M6.25 9.25h3.5" />
           </svg>
         </button>
       </div>
@@ -179,12 +174,12 @@ export function FileTree({ root, data, activePath, onOpenFile, onRefresh, onPath
               openByDefault={false}
               disableMultiSelection
               onActivate={(node) => {
-                if (node.isLeaf) onOpenFile(node.id)
+                if (!node.data.missing) onOpenFile(node.id)
               }}
               onRename={({ id, name }) =>
                 void guard(async () => {
                   const newPath = await api.renameEntry(id, name)
-                  onPathsMoved({ [id]: newPath })
+                  onPathsMoved({ [id]: newPath, [stripExt(id)]: stripExt(newPath) })
                   await onRefresh()
                 })
               }
@@ -222,14 +217,14 @@ function Row({ node, style, dragHandle }: NodeRendererProps<TreeEntry>) {
       ref={dragHandle}
       style={style}
       className={cls}
-      onClick={() => node.isInternal && node.toggle()}
+      onClick={() => node.toggle()}
       onContextMenu={(e) => {
         e.preventDefault()
         e.stopPropagation()
         openContextMenu(node)
       }}
     >
-      <span className="chev">{node.isInternal ? (node.isOpen ? '▾' : '▸') : ''}</span>
+      <span className="chev">{node.children && node.children.length > 0 ? (node.isOpen ? '▾' : '▸') : ''}</span>
       <NodeIcon node={node} />
       {node.isEditing ? <RenameInput node={node} /> : <span className="tree-name">{node.data.name}</span>}
     </div>
@@ -237,12 +232,8 @@ function Row({ node, style, dragHandle }: NodeRendererProps<TreeEntry>) {
 }
 
 function NodeIcon({ node }: { node: TreeNode }) {
-  return node.isInternal ? (
-    <svg className="tree-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
-      <path d="M1.5 4a.5.5 0 0 1 .5-.5h3.6l1.4 1.5H14a.5.5 0 0 1 .5.5v7a.5.5 0 0 1-.5.5H2a.5.5 0 0 1-.5-.5Z" />
-    </svg>
-  ) : (
-    <svg className="tree-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+  return (
+    <svg className={node.data.missing ? 'tree-icon tree-icon-missing' : 'tree-icon'} viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
       <path d="M4 1.5h5l3.5 3.5v9a.5.5 0 0 1-.5.5H4a.5.5 0 0 1-.5-.5v-12A.5.5 0 0 1 4 1.5Z" />
     </svg>
   )
@@ -254,12 +245,7 @@ function RenameInput({ node }: { node: TreeNode }) {
       className="tree-rename"
       autoFocus
       defaultValue={node.data.name}
-      onFocus={(e) => {
-        // Select the name without its extension.
-        const v = e.currentTarget.value
-        const dot = v.lastIndexOf('.')
-        e.currentTarget.setSelectionRange(0, node.isLeaf && dot > 0 ? dot : v.length)
-      }}
+      onFocus={(e) => e.currentTarget.select()}
       onBlur={() => node.reset()}
       onClick={(e) => e.stopPropagation()}
       onContextMenu={(e) => e.stopPropagation()}

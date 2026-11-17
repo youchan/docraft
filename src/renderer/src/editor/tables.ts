@@ -36,6 +36,15 @@ const INLINE = /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*]+\*)|(\[[^\]]+\]\([^)\s]+\))/g
 
 /** Append `text` to `parent` with a few inline Markdown constructs rendered (built with DOM APIs, no HTML parsing). */
 function appendInline(parent: HTMLElement, text: string): void {
+  // `<br>` inside a cell is a line break: render each segment, joined by real <br> elements.
+  const parts = text.split(/<br\s*\/?>/i)
+  if (parts.length > 1) {
+    parts.forEach((part, i) => {
+      if (i > 0) parent.append(document.createElement('br'))
+      appendInline(parent, part.trim())
+    })
+    return
+  }
   let last = 0
   for (const m of text.matchAll(INLINE)) {
     const i = m.index ?? 0

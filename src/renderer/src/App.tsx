@@ -4,7 +4,8 @@ import { FileTree } from './FileTree'
 import { readmeText } from './welcome'
 import { Calendar, DailyList } from './Daily'
 import { today } from './dueFormat'
-import { SubtaskBar, TodoList } from './Todo'
+import { ChildBar } from './ChildBar'
+import { SubtaskBar, TodoList, TodoOverview } from './Todo'
 import { applyDue, applyTitle, parseDue, parseTitle } from '../../shared/frontmatter'
 import { buildLinkIndex, type LinkSuggestion } from './links'
 import type { MenuCommand, TodoItem, TodoRef, TreeEntry } from '../../shared/api'
@@ -314,6 +315,16 @@ export function App() {
     [flushSave, closeDocument, refreshTodos, refreshSubtasks]
   )
 
+  const restoreTodo = useCallback(
+    async (path: string) => {
+      await flushSave()
+      const restored = await api.restoreTodo(path)
+      await openPath(restored)
+      await Promise.all([refreshTodos(), refreshSubtasks()])
+    },
+    [flushSave, openPath, refreshTodos, refreshSubtasks]
+  )
+
   /** Rename = change the title heading. The file keeps its UUID name, so references stay valid. */
   const renameTodo = useCallback(
     async (path: string, title: string) => {
@@ -342,9 +353,33 @@ export function App() {
     [flushSave, closeDocument, refreshTodos, refreshSubtasks]
   )
 
+  // ---- Child pages: `A.md` is the parent of the pages in `A/` ----------------------
+  const pageNode = useMemo(() => {
+    if (!folder || !currentPath) return null
+    const find = (entries: TreeEntry[], parent: TreeEntry | null): { node: TreeEntry; parent: TreeEntry | null } | null => {
+      for (const e of entries) {
+        if (e.id === currentPath) return { node: e, parent }
+        const hit = find(e.children, e)
+        if (hit) return hit
+      }
+      return null
+    }
+    return find(folder.tree, null)
+  }, [folder, currentPath])
+
+  const createChild = useCallback(
+    async (parent: string, name: string) => {
+      const path = await api.createEntry(parent, name)
+      await refreshTree()
+      await openPath(path)
+    },
+    [refreshTree, openPath]
+  )
+
   // ---- Daily documents (<root>/.daily/YYYY/MM/DD.md) -----------------------------
   const [dailyDates, setDailyDates] = useState<string[]>([])
   const [calendarOpen, setCalendarOpen] = useState(false)
+  const [overviewOpen, setOverviewOpen] = useState(false)
 
   const refreshDaily = useCallback(async () => {
     if (!folderRootRef.current) return
@@ -358,7 +393,10 @@ export function App() {
   }, [root, refreshDaily])
 
   // Opening any document (e.g. from the sidebar) dismisses the calendar.
-  useEffect(() => setCalendarOpen(false), [currentPath])
+  useEffect(() => {
+    setCalendarOpen(false)
+    setOverviewOpen(false)
+  }, [currentPath])
 
   const openDay = useCallback(
     async (date: string) => {
@@ -498,7 +536,10 @@ export function App() {
                 dates={dailyDates}
                 activeDate={activeDate}
                 onOpen={(d) => void openDay(d).catch(report)}
-                onOpenCalendar={() => setCalendarOpen(true)}
+                onOpenCalendar={() => {
+                  setOverviewOpen(false)
+                  setCalendarOpen(true)
+                }}
               />
               <TodoList
                 items={todos}
@@ -509,6 +550,10 @@ export function App() {
                 onRename={(p, t) => void renameTodo(p, t).catch(report)}
                 onSetDue={(p, d) => void setTodoDue(p, d).catch(report)}
                 onTrash={(p) => void trashTodo(p).catch(report)}
+                onOpenOverview={() => {
+                  setCalendarOpen(false)
+                  setOverviewOpen(true)
+                }}
               />
               <FileTree
                 root={folder.root}
@@ -532,8 +577,38 @@ export function App() {
             onClose={() => setCalendarOpen(false)}
           />
         )}
+        {overviewOpen && (
+          <TodoOverview
+            open={todos}
+            completed={todoRefs.filter((r) => r.completed)}
+            parentTitle={(u) => todoRefs.find((r) => r.uuid === u)?.title ?? null}
+            activePath={currentPath}
+            onOpen={(p) => void openPath(p).catch(report)}
+            onClose={() => setOverviewOpen(false)}
+          />
+        )}
+        {inCompleted && currentPath && (
+          <div id="restore-bar">
+            <span>このTODOは完了済みです</span>
+            <button className="done-btn" title="未完了に戻す" onClick={() => void restoreTodo(currentPath).catch(report)}>
+              ↩ 未完了に戻す
+            </button>
+          </div>
+        )}
+        {mode === 'file' && !inTodoDir && currentPath && pageNode && (
+          <ChildBar
+            title={pageNode.node.name}
+            items={pageNode.node.children}
+            onOpen={(p) => void openPath(p).catch(report)}
+            onCreate={(n) => void createChild(currentPath, n).catch(report)}
+            onOpenParent={
+              pageNode.parent && !pageNode.parent.missing ? () => void openPath((pageNode.parent as TreeEntry).id).catch(report) : null
+            }
+          />
+        )}
         {inTodo && currentPath && (
           <SubtaskBar
+            completedItems={todoRefs.filter((r) => r.completed && r.parent !== null && currentPath.endsWith(r.parent + '.md'))}
             title={openTitle ?? '無題'}
             items={subtasks}
             onOpen={(p) => void openPath(p).catch(report)}

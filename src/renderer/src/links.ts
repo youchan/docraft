@@ -61,10 +61,8 @@ export function buildLinkIndex(root: string, tree: TreeEntry[]): LinkIndex {
 
   const walk = (entries: TreeEntry[]): void => {
     for (const e of entries) {
-      if (e.children) {
-        walk(e.children)
-        continue
-      }
+      walk(e.children)
+      if (e.missing) continue
       const full = slashed(e.id)
       const relShown = (full.startsWith(rootPrefix) ? full.slice(rootPrefix.length) : full).replace(EXT, '')
       const rel = norm(relShown)

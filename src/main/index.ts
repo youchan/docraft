@@ -91,23 +91,39 @@ async function uniqueName(dir: string, base: string, ext: string): Promise<strin
 const MD_EXTS = new Set(['.md', '.markdown'])
 const IGNORED_DIRS = new Set(['node_modules'])
 
-/** Scan a folder: directories (always) and Markdown files. Dot-entries and symlinks are skipped. */
+/** The folder that holds a page's children: same path without `.md` (`A.md` -> `A/`). */
+function pageDir(file: string): string {
+  return join(dirname(file), basename(file, extname(file)))
+}
+
+/**
+ * Scan a folder as a page tree: `A.md` is a page and `A/` holds its children (also pages).
+ * A folder without a matching `A.md` shows up as a page that has no file yet (`missing`).
+ * Dot-entries and symlinks are skipped.
+ */
 async function scanTree(dir: string): Promise<TreeEntry[]> {
   const entries = await readdir(dir, { withFileTypes: true })
-  const dirs: TreeEntry[] = []
-  const files: TreeEntry[] = []
+  const dirs = new Set<string>()
+  const files = new Map<string, string>() // base name -> file name
   for (const e of entries) {
     if (e.name.startsWith('.')) continue
-    const full = join(dir, e.name)
     if (e.isDirectory()) {
-      if (IGNORED_DIRS.has(e.name)) continue
-      dirs.push({ id: full, name: e.name, children: await scanTree(full).catch(() => []) })
+      if (!IGNORED_DIRS.has(e.name)) dirs.add(e.name)
     } else if (e.isFile() && MD_EXTS.has(extname(e.name).toLowerCase())) {
-      files.push({ id: full, name: e.name })
+      const base = basename(e.name, extname(e.name))
+      if (!files.has(base)) files.set(base, e.name)
     }
   }
-  const byName = (a: TreeEntry, b: TreeEntry): number => a.name.localeCompare(b.name, 'ja', { numeric: true })
-  return [...dirs.sort(byName), ...files.sort(byName)]
+  const out: TreeEntry[] = []
+  for (const [base, fileName] of files) {
+    const children = dirs.has(base) ? await scanTree(join(dir, base)).catch(() => []) : []
+    out.push({ id: join(dir, fileName), name: base, children })
+  }
+  for (const d of dirs) {
+    if (files.has(d)) continue
+    out.push({ id: join(dir, `${d}.md`), name: d, children: await scanTree(join(dir, d)).catch(() => []), missing: true })
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name, 'ja', { numeric: true }))
 }
 
 // ---------------------------------------------------------------------------
@@ -208,14 +224,23 @@ async function listAllTodos(root: string): Promise<TodoRef[]> {
   const out: TodoRef[] = []
   const walk = async (dir: string): Promise<void> => {
     for (const t of await listMarkdown(dir, true)) {
-      out.push({ uuid: basename(t.id, extname(t.id)), id: t.id, title: t.name, completed: false, due: t.due })
+      out.push({ uuid: basename(t.id, extname(t.id)), id: t.id, title: t.name, completed: false, due: t.due, completedAt: null, parent: null })
       await walk(subtaskDir(t.id))
     }
   }
   const base = join(root, TODO_DIR)
   await walk(base)
   for (const t of await listMarkdown(join(base, COMPLETED_DIR), true)) {
-    out.push({ uuid: basename(t.id, extname(t.id)), id: t.id, title: t.name, completed: true, due: t.due })
+    const text = await readFile(t.id, 'utf8').catch(() => '')
+    out.push({
+      uuid: basename(t.id, extname(t.id)),
+      id: t.id,
+      title: t.name,
+      completed: true,
+      due: t.due,
+      completedAt: parseKey(text, 'completed'),
+      parent: parseKey(text, 'parent')
+    })
   }
   return out
 }
@@ -247,6 +272,24 @@ async function completeTodoTree(st: WindowState, file: string): Promise<void> {
     await rmdir(subtaskDir(f)).catch(() => undefined) // only succeeds when empty
   }
   await walk(file)
+}
+
+/** Path of the open (not completed) TODO or subtask whose file name is `<uuid>.md`, or null. */
+async function findOpenTodo(dir: string, uuid: string): Promise<string | null> {
+  let entries
+  try {
+    entries = await readdir(dir, { withFileTypes: true })
+  } catch {
+    return null
+  }
+  if (entries.some((e) => e.isFile() && e.name === `${uuid}.md`)) return join(dir, `${uuid}.md`)
+  for (const e of entries) {
+    if (e.isDirectory() && !e.name.startsWith('.')) {
+      const hit = await findOpenTodo(join(dir, e.name), uuid)
+      if (hit) return hit
+    }
+  }
+  return null
 }
 
 /** UUIDs mentioned as `[[todo:UUID]]` anywhere in the documents folder (hidden folders included). */
@@ -567,63 +610,81 @@ function registerIpc(): void {
     return scanTree(st.root)
   })
 
-  ipcMain.handle('entry:create', async (e, parent: unknown, kind: unknown): Promise<string> => {
+  /** A page's child folder (or the documents folder itself) as the place for new/moved pages. */
+  const containerOf = async (st: WindowState, parent: unknown): Promise<string> => {
+    if (typeof parent === 'string' && st.root && resolve(parent) === st.root) return st.root
+    const dir = pageDir(assertInsideRoot(st, parent))
+    await mkdir(dir, { recursive: true })
+    return dir
+  }
+
+  ipcMain.handle('entry:create', async (e, parent: unknown, name: unknown): Promise<string> => {
     const st = stateOf(e.sender)
-    const dir = typeof parent === 'string' && st.root && resolve(parent) === st.root ? st.root : assertInsideRoot(st, parent)
-    if (!(await stat(dir)).isDirectory()) throw new Error('parent is not a folder')
-    if (kind === 'folder') {
-      const target = join(dir, await uniqueName(dir, 'New Folder', ''))
-      await mkdir(target)
-      return target
-    }
-    const target = join(dir, await uniqueName(dir, 'Untitled', '.md'))
+    const dir = await containerOf(st, parent)
+    const base = name === undefined || name === null ? 'Untitled' : assertValidName(name).replace(/\.(md|markdown)$/i, '')
+    const target = join(dir, await uniqueName(dir, base, '.md'))
     await writeFile(target, '', { encoding: 'utf8', flag: 'wx' })
     return target
   })
 
+  // Renaming a page renames its child folder with it.
   ipcMain.handle('entry:rename', async (e, path: unknown, newName: unknown): Promise<string> => {
     const st = stateOf(e.sender)
     const src = assertInsideRoot(st, path)
-    let name = assertValidName(newName)
-    if ((await stat(src)).isFile() && !extname(name)) name += '.md'
-    const dest = join(dirname(src), name)
+    const ext = extname(src) || '.md'
+    const name = assertValidName(newName).replace(/\.(md|markdown)$/i, '')
+    const dest = join(dirname(src), name + ext)
     if (dest === src) return src
-    if (await exists(dest)) throw new Error(`「${name}」はすでに存在します。`)
-    await rename(src, dest)
+    const srcDir = pageDir(src)
+    const destDir = pageDir(dest)
+    const hasFile = await exists(src)
+    const hasDir = await exists(srcDir)
+    if ((hasFile && (await exists(dest))) || (hasDir && (await exists(destDir)))) throw new Error(`「${name}」はすでに存在します。`)
+    if (hasFile) await rename(src, dest)
+    if (hasDir) await rename(srcDir, destDir)
     return dest
   })
 
-  ipcMain.handle('entry:move', async (e, paths: unknown, destDir: unknown): Promise<Record<string, string>> => {
+  // Moving a page into another page makes it a child (and brings its own children along).
+  ipcMain.handle('entry:move', async (e, paths: unknown, destParent: unknown): Promise<Record<string, string>> => {
     const st = stateOf(e.sender)
     if (!Array.isArray(paths)) throw new Error('invalid paths')
-    const dest = typeof destDir === 'string' && st.root && resolve(destDir) === st.root ? st.root : assertInsideRoot(st, destDir)
+    const dest = await containerOf(st, destParent)
     const moved: Record<string, string> = {}
     for (const p of paths) {
       const src = assertInsideRoot(st, p)
-      if (dest === src || dest.startsWith(src + sep)) throw new Error('フォルダを自分自身の中には移動できません。')
+      const srcDir = pageDir(src)
+      if (dest === srcDir || dest.startsWith(srcDir + sep)) throw new Error('ページを自分自身の中には移動できません。')
+      if (dirname(src) === dest) continue
       const target = join(dest, basename(src))
-      if (target === src) continue
-      if (await exists(target)) throw new Error(`「${basename(src)}」は移動先にすでに存在します。`)
-      await rename(src, target)
+      const targetDir = pageDir(target)
+      const hasFile = await exists(src)
+      const hasDir = await exists(srcDir)
+      if ((hasFile && (await exists(target))) || (hasDir && (await exists(targetDir)))) {
+        throw new Error(`「${basename(src, extname(src))}」は移動先にすでに存在します。`)
+      }
+      if (hasFile) await rename(src, target)
+      if (hasDir) await rename(srcDir, targetDir)
       moved[src] = target
+      moved[srcDir] = targetDir
     }
     return moved
   })
 
-  ipcMain.handle('entry:reveal', (e, path: unknown): void => {
-    shell.showItemInFolder(assertInsideRoot(stateOf(e.sender), path))
+  ipcMain.handle('entry:reveal', async (e, path: unknown): Promise<void> => {
+    const file = assertInsideRoot(stateOf(e.sender), path)
+    shell.showItemInFolder((await exists(file)) ? file : pageDir(file))
   })
 
-  ipcMain.handle('menu:context', (e, kind: unknown, targetFolder: unknown): Promise<ContextAction | null> => {
-    const k = kind === 'file' || kind === 'folder' ? kind : 'root'
-    const where = typeof targetFolder === 'string' ? targetFolder : ''
+  ipcMain.handle('menu:context', (e, kind: unknown, targetName: unknown): Promise<ContextAction | null> => {
+    const k = kind === 'file' ? 'file' : 'root'
+    const where = typeof targetName === 'string' ? targetName : ''
     return new Promise((done) => {
       const pick = (a: ContextAction) => () => done(a)
       const template: MenuItemConstructorOptions[] = [
-        { label: `「${where}」に新規ファイル`, click: pick('newFile') },
-        { label: `「${where}」に新規フォルダ`, click: pick('newFolder') }
+        { label: k === 'root' ? `「${where}」に新規ページ` : `「${where}」に子ページを追加`, click: pick('newFile') }
       ]
-      if (k !== 'root') {
+      if (k === 'file') {
         template.push(
           { type: 'separator' },
           { label: '名前を変更', click: pick('rename') },
@@ -638,22 +699,28 @@ function registerIpc(): void {
     })
   })
 
+  // Trashing a page trashes its child folder with it.
   ipcMain.handle('entry:trash', async (e, paths: unknown): Promise<boolean> => {
     const st = stateOf(e.sender)
     if (!Array.isArray(paths) || paths.length === 0) return false
     const targets = paths.map((p) => assertInsideRoot(st, p))
     const win = BrowserWindow.fromWebContents(e.sender)
+    const nameOf = (p: string): string => basename(p, extname(p))
+    const hasChildren = (await Promise.all(targets.map((t) => exists(pageDir(t))))).some(Boolean)
     const opts: Electron.MessageBoxOptions = {
       type: 'warning',
       buttons: ['ゴミ箱に移動', 'キャンセル'],
       defaultId: 1,
       cancelId: 1,
-      message:
-        targets.length === 1 ? `「${basename(targets[0])}」をゴミ箱に移動しますか?` : `${targets.length} 件をゴミ箱に移動しますか?`
+      message: targets.length === 1 ? `「${nameOf(targets[0])}」をゴミ箱に移動しますか?` : `${targets.length} 件をゴミ箱に移動しますか?`,
+      ...(hasChildren ? { detail: '子ページもまとめて移動されます。' } : {})
     }
     const res = win ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts)
     if (res.response !== 0) return false
-    for (const t of targets) await shell.trashItem(t)
+    for (const t of targets) {
+      if (await exists(t)) await shell.trashItem(t)
+      if (await exists(pageDir(t))) await shell.trashItem(pageDir(t))
+    }
     return true
   })
 
@@ -727,6 +794,23 @@ function registerIpc(): void {
     }
     await completeTodoTree(st, file)
     return true
+  })
+
+  ipcMain.handle('todo:restore', async (e, completedPath: unknown): Promise<string> => {
+    const st = stateOf(e.sender)
+    const abs = typeof completedPath === 'string' ? resolve(completedPath) : ''
+    const completedDir = join(todoRoot(st), COMPLETED_DIR)
+    if (dirname(abs) !== completedDir || extname(abs).toLowerCase() !== '.md') throw new Error('not a completed TODO')
+    let text = await readFile(abs, 'utf8')
+    const parent = parseKey(text, 'parent')
+    const parentFile = parent && isUuid(parent) ? await findOpenTodo(todoRoot(st), parent) : null
+    const dir = parentFile ? subtaskDir(parentFile) : todoRoot(st)
+    text = applyKey(applyKey(text, 'completed', null), 'parent', null)
+    await mkdir(dir, { recursive: true })
+    const target = join(dir, basename(abs))
+    await writeFile(target, text, { encoding: 'utf8', flag: 'wx' })
+    await unlink(abs)
+    return target
   })
 
   // Renaming only rewrites the title heading: the file (and so the TODO's key) stays where it is.

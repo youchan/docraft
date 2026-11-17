@@ -9,6 +9,7 @@ import { languages } from '@codemirror/language-data'
 import { highlightSelectionMatches, search, searchKeymap } from '@codemirror/search'
 import { livePreview, refreshLinks } from './editor/livePreview'
 import { frontmatterStyle, movePastFrontmatter, replaceWholeDoc } from './editor/frontmatter'
+import { mermaidBlocks } from './editor/mermaid'
 import { tables } from './editor/tables'
 import type { LinkSuggestion } from './links'
 import { docraftHighlight } from './editor/highlight'
@@ -102,6 +103,7 @@ function createState(doc: string, hooks: Hooks, readOnly: boolean): EditorState 
         openUrl: hooks.openUrl
       }),
       tables(),
+      mermaidBlocks(),
       frontmatterStyle(),
       EditorView.updateListener.of((u) => {
         if (u.docChanged) hooks.onChange()

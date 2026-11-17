@@ -271,6 +271,43 @@ function buildDecorations(view: EditorView, opts: LivePreviewOptions): Decoratio
             }
           }
 
+          // `[[WIP] title](url)`: the parser only sees the inner `[WIP]` as a Link, so an outer link whose text
+          // contains brackets is recognised here by matching the brackets by hand. This is a normal link, not a wiki link.
+          if (marks.length === 2 && node.from > 0 && doc.sliceString(node.from - 1, node.from) === '[') {
+            const outerFrom = node.from - 1
+            const line = doc.lineAt(outerFrom)
+            const rest = doc.sliceString(outerFrom, line.to)
+            let depth = 0
+            let close = -1
+            for (let i = 0; i < rest.length; i++) {
+              const c = rest[i]
+              if (c === '\\') i++
+              else if (c === '[') depth++
+              else if (c === ']' && --depth === 0) {
+                close = i
+                break
+              }
+            }
+            const url = close > 0 ? /^\(([^)\s]+)\)/.exec(rest.slice(close + 1)) : null
+            if (url && close > 1) {
+              const textFrom = outerFrom + 1
+              const textTo = outerFrom + close
+              const outerTo = textTo + 1 + url[0].length
+              const rendered = !isActive(outerFrom, outerTo)
+              decos.push(
+                Decoration.mark({
+                  class: `cm-md-link${rendered ? ' cm-md-link-rendered' : ''}`,
+                  attributes: { 'data-url': url[1] }
+                }).range(textFrom, textTo)
+              )
+              if (rendered) {
+                hide(outerFrom, textFrom) // "["
+                hide(textTo, outerTo) // "](url)"
+              }
+              return false
+            }
+          }
+
           if (marks.length >= 2) {
             const rendered = !isActive(node.from, node.to)
             const urlNode = node.getChild('URL')

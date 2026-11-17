@@ -1,9 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { isOverdue, shortDate } from './dueFormat'
-import type { TodoItem } from '../../shared/api'
+import type { TodoItem, TodoRef } from '../../shared/api'
 
 /** Inline title input (new or rename). Enter adds, Escape/blur cancels. */
-function AddInput({
+export function AddInput({
   placeholder,
   initial = '',
   onSubmit,
@@ -91,7 +91,7 @@ function DueBadge({
   )
 }
 
-function PlusIcon() {
+export function PlusIcon() {
   return (
     <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
       <path d="M8 3v10M3 8h10" />
@@ -108,10 +108,12 @@ export function TodoList({
   onComplete,
   onRename,
   onSetDue,
-  onTrash
+  onTrash,
+  onOpenOverview
 }: {
   items: TodoItem[]
   activePath: string | null
+  onOpenOverview: () => void
   onOpen: (path: string) => void
   onCreate: (title: string) => void
   onComplete: (path: string) => void
@@ -124,7 +126,9 @@ export function TodoList({
   return (
     <div id="todo-list">
       <div className="sidebar-head">
-        <span className="sidebar-title">TODO</span>
+        <button className="sidebar-title sidebar-title-link" title="TODO一覧(完了済みを含む)を開く" onClick={onOpenOverview}>
+          TODO
+        </button>
         <button className="icon-btn" title="TODOを追加" onClick={() => setAdding(true)}>
           <PlusIcon />
         </button>
@@ -203,10 +207,13 @@ export function SubtaskBar({
   due,
   onSetOwnDue,
   onCompleteSelf,
-  onOpenParent
+  onOpenParent,
+  completedItems
 }: {
   title: string
   items: TodoItem[]
+  /** Completed subtasks of the open TODO (shown when 「完了済みを表示する」 is checked). */
+  completedItems: TodoRef[]
   onOpen: (path: string) => void
   onCreate: (title: string) => void
   onComplete: (path: string) => void
@@ -222,6 +229,7 @@ export function SubtaskBar({
 }) {
   const [adding, setAdding] = useState(false)
   const [renaming, setRenaming] = useState<string | null>(null)
+  const [showDone, setShowDone] = useState(false)
   return (
     <div id="subtask-bar">
       <div className="subtask-head">
@@ -232,6 +240,10 @@ export function SubtaskBar({
         )}
         <span className="subtask-title">{title} のサブタスク</span>
         <span className="subtask-spacer" />
+        <label className="show-done" title="完了済みのサブタスクも表示する">
+          <input type="checkbox" checked={showDone} onChange={(e) => setShowDone(e.target.checked)} />
+          完了済みを表示する
+        </label>
         <DueBadge due={due} onChange={onSetOwnDue} showEmpty />
         <button className="done-btn" title="このTODOを完了にする" onClick={onCompleteSelf}>
           ✓ 完了
@@ -265,7 +277,15 @@ export function SubtaskBar({
             </span>
           )
         )}
-        {items.length === 0 && !adding && <span className="todo-empty">なし</span>}
+        {showDone &&
+          completedItems.map((t) => (
+            <span key={t.uuid} className="subtask-chip subtask-chip-done" title={t.completedAt ? `完了: ${t.completedAt}` : '完了済み'}>
+              <button className="subtask-name" onClick={() => onOpen(t.id)}>
+                {t.title}
+              </button>
+            </span>
+          ))}
+        {items.length === 0 && (!showDone || completedItems.length === 0) && !adding && <span className="todo-empty">なし</span>}
         {adding && (
           <AddInput
             placeholder="サブタスクのタイトル"
@@ -276,6 +296,74 @@ export function SubtaskBar({
             }}
           />
         )}
+      </div>
+    </div>
+  )
+}
+
+/** Right-pane overview of all TODOs, switchable between open and completed. */
+export function TodoOverview({
+  open,
+  completed,
+  parentTitle,
+  activePath,
+  onOpen,
+  onClose
+}: {
+  open: TodoItem[]
+  completed: TodoRef[]
+  /** Title of a completed subtask's parent, by parent UUID. */
+  parentTitle: (uuid: string) => string | null
+  activePath: string | null
+  onOpen: (path: string) => void
+  onClose: () => void
+}) {
+  const [tab, setTab] = useState<'open' | 'done'>('open')
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+  const done = [...completed].sort((a, b) => (b.completedAt ?? '').localeCompare(a.completedAt ?? ''))
+  return (
+    <div id="calendar-overlay">
+      <div className="calendar todo-overview">
+        <div className="calendar-head">
+          <span className="calendar-title">TODO</span>
+          <button className={`overview-tab${tab === 'open' ? ' active' : ''}`} onClick={() => setTab('open')}>
+            未完了 ({open.length})
+          </button>
+          <button className={`overview-tab${tab === 'done' ? ' active' : ''}`} onClick={() => setTab('done')}>
+            完了 ({done.length})
+          </button>
+          <span className="subtask-spacer" />
+          <button className="icon-btn" title="閉じる (Esc)" onClick={onClose}>
+            ×
+          </button>
+        </div>
+        <div className="todo-items">
+          {tab === 'open'
+            ? open.map((t) => (
+                <div key={t.id} className={`todo-row${t.id === activePath ? ' active' : ''}`} onClick={() => onOpen(t.id)}>
+                  <span className="todo-name">{t.name}</span>
+                  {t.due && <span className="overview-date">{shortDate(t.due)}</span>}
+                </div>
+              ))
+            : done.map((t) => {
+                const parent = t.parent ? parentTitle(t.parent) : null
+                return (
+                  <div key={t.uuid} className={`todo-row${t.id === activePath ? ' active' : ''}`} onClick={() => onOpen(t.id)}>
+                    <span className="todo-name">{parent ? `${parent}/${t.title}` : t.title}</span>
+                    {t.completedAt && <span className="overview-date">完了 {shortDate(t.completedAt)}</span>}
+                  </div>
+                )
+              })}
+          {(tab === 'open' ? open.length : done.length) === 0 && (
+            <div className="todo-empty">{tab === 'open' ? '未完了のTODOはありません' : '完了済みのTODOはありません'}</div>
+          )}
+        </div>
       </div>
     </div>
   )
